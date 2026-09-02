@@ -8,7 +8,7 @@ use mg_plan::{
 };
 
 fn usage() -> &'static str {
-    "usage:\n  mg-plan create <db> <plan-id> <title>\n  mg-plan show <db> <plan-id>\n  mg-plan export <db> <plan-id>\n  mg-plan import <db> <json-file>\n  mg-plan add-work <db> <plan-id> <work-id> <title>\n  mg-plan add-dependency <db> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <db> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <db> <plan-id> <work-id>\n  mg-plan revise <db> <plan-id> <work-id> <title>\n  mg-plan verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <db> <plan-id> <work-id>\n  mg-plan list-work <db> <plan-id>\n  mg-plan blocked <db> <plan-id>\n  mg-plan verification-gaps <db> <plan-id>"
+    "usage:\n  mg-plan create <db> <plan-id> <title>\n  mg-plan show <db> <plan-id>\n  mg-plan export <db> <plan-id>\n  mg-plan import <db> <json-file>\n  mg-plan add-work <db> <plan-id> <work-id> <title>\n  mg-plan add-dependency <db> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <db> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <db> <plan-id> <work-id>\n  mg-plan revise <db> <plan-id> <work-id> <title>\n  mg-plan verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <db> <plan-id> <work-id>\n  mg-plan list-work <db> <plan-id>\n  mg-plan blocked <db> <plan-id>\n  mg-plan verification-gaps <db> <plan-id>\n  mg-plan add-project <db> <plan-id> <project-id> <title>\n  mg-plan add-milestone <db> <plan-id> <project-id> <milestone-id> <title>\n  mg-plan link-work <db> <plan-id> <milestone-id> <work-id>\n  mg-plan decide <db> <plan-id> <decision-id> <question> <decision> <rationale>\n  mg-plan milestones <db> <plan-id>"
 }
 
 fn plan_id(value: String) -> Result<PlanId, String> {
@@ -204,6 +204,74 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             store
                 .save_if_revision(&plan, revision)
                 .map_err(|error| error.to_string())?;
+        }
+        "add-project" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let (mut store, mut plan, revision) =
+                load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
+            let project = mg_plan::ProjectId::new(args.next().ok_or_else(|| usage().to_owned())?)
+                .map_err(|error| error.to_string())?;
+            let title = args.collect::<Vec<_>>().join(" ");
+            plan.add_project(project.clone(), title).map_err(domain)?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
+            println!("{project}");
+        }
+        "add-milestone" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let (mut store, mut plan, revision) =
+                load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
+            let project = mg_plan::ProjectId::new(args.next().ok_or_else(|| usage().to_owned())?)
+                .map_err(|error| error.to_string())?;
+            let milestone =
+                mg_plan::MilestoneId::new(args.next().ok_or_else(|| usage().to_owned())?)
+                    .map_err(|error| error.to_string())?;
+            let title = args.collect::<Vec<_>>().join(" ");
+            plan.add_milestone(&project, milestone.clone(), title)
+                .map_err(domain)?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
+            println!("{milestone}");
+        }
+        "link-work" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let (mut store, mut plan, revision) =
+                load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
+            let milestone =
+                mg_plan::MilestoneId::new(args.next().ok_or_else(|| usage().to_owned())?)
+                    .map_err(|error| error.to_string())?;
+            let work = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
+            plan.link_work_item_to_milestone(&milestone, &work)
+                .map_err(domain)?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
+        }
+        "decide" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let (mut store, mut plan, revision) =
+                load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
+            let decision = mg_plan::DecisionId::new(args.next().ok_or_else(|| usage().to_owned())?)
+                .map_err(|error| error.to_string())?;
+            let question = args.next().ok_or_else(|| usage().to_owned())?;
+            let decision_text = args.next().ok_or_else(|| usage().to_owned())?;
+            let rationale = args.collect::<Vec<_>>().join(" ");
+            plan.record_decision(decision, question, decision_text, rationale)
+                .map_err(domain)?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
+        }
+        "milestones" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let (_, plan, _) = load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan.milestone_summaries())
+                    .map_err(|_| "could not serialize milestone result".to_owned())?
+            );
         }
         "list-work" | "blocked" | "verification-gaps" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;

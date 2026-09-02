@@ -39,6 +39,11 @@ cargo run -- complete <db> <plan-id> <work-id>
 cargo run -- list-work <db> <plan-id>
 cargo run -- blocked <db> <plan-id>
 cargo run -- verification-gaps <db> <plan-id>
+cargo run -- add-project <db> <plan-id> <project-id> <title>
+cargo run -- add-milestone <db> <plan-id> <project-id> <milestone-id> <title>
+cargo run -- link-work <db> <plan-id> <milestone-id> <work-id>
+cargo run -- decide <db> <plan-id> <decision-id> <question> <decision> <rationale>
+cargo run -- milestones <db> <plan-id>
 ```
 
 Mutation commands load the authoritative aggregate and its SQLite revision, apply domain
@@ -50,6 +55,10 @@ CLI stores references and revision-pinned verification records rather than raw e
 The query commands are read-only projections. `list-work` returns stable summaries ordered by
 identifier; `blocked` filters explicit blocked state; `verification-gaps` reports one typed gap
 per criterion whose latest proof is missing, non-passing, stale, or missing evidence.
+
+Projects and milestones organize existing work without owning completion separately. Milestone
+completion is derived from linked work-item status. Decisions are recorded in the plan as
+rationale-bearing records; they do not mutate work status or replace evidence verification.
 
 ## Current non-goals
 

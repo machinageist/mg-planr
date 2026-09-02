@@ -46,6 +46,9 @@ define_id!(WorkItemId);
 define_id!(CriterionId);
 define_id!(VerificationId);
 define_id!(EvidenceId);
+define_id!(ProjectId);
+define_id!(MilestoneId);
+define_id!(DecisionId);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum WorkItemStatus {
@@ -182,11 +185,50 @@ pub struct VerificationGap {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Project {
+    pub id: ProjectId,
+    pub title: String,
+    pub milestone_ids: Vec<MilestoneId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Milestone {
+    pub id: MilestoneId,
+    pub project_id: ProjectId,
+    pub title: String,
+    pub work_item_ids: BTreeSet<WorkItemId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Decision {
+    pub id: DecisionId,
+    pub question: String,
+    pub decision: String,
+    pub rationale: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MilestoneSummary {
+    pub id: MilestoneId,
+    pub project_id: ProjectId,
+    pub title: String,
+    pub total_work_items: usize,
+    pub completed_work_items: usize,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Plan {
     id: PlanId,
     title: String,
     work_items: BTreeMap<WorkItemId, WorkItem>,
     dependencies: BTreeSet<(WorkItemId, WorkItemId)>,
+    #[serde(default)]
+    projects: BTreeMap<ProjectId, Project>,
+    #[serde(default)]
+    milestones: BTreeMap<MilestoneId, Milestone>,
+    #[serde(default)]
+    decisions: BTreeMap<DecisionId, Decision>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,6 +259,12 @@ pub enum PlanError {
         to: WorkItemStatus,
     },
     EmptyVerifier,
+    DuplicateProject(ProjectId),
+    DuplicateMilestone(MilestoneId),
+    DuplicateDecision(DecisionId),
+    ProjectNotFound(ProjectId),
+    MilestoneNotFound(MilestoneId),
+    WorkItemAlreadyLinked(WorkItemId),
 }
 
 impl fmt::Display for PlanError {
@@ -254,6 +302,12 @@ impl fmt::Display for PlanError {
                 write!(formatter, "invalid work-item transition: {from} -> {to}")
             }
             Self::EmptyVerifier => formatter.write_str("verifier must not be empty"),
+            Self::DuplicateProject(id) => write!(formatter, "project already exists: {id}"),
+            Self::DuplicateMilestone(id) => write!(formatter, "milestone already exists: {id}"),
+            Self::DuplicateDecision(id) => write!(formatter, "decision already exists: {id}"),
+            Self::ProjectNotFound(id) => write!(formatter, "project not found: {id}"),
+            Self::MilestoneNotFound(id) => write!(formatter, "milestone not found: {id}"),
+            Self::WorkItemAlreadyLinked(id) => write!(formatter, "work item already linked: {id}"),
         }
     }
 }
@@ -272,6 +326,9 @@ impl Plan {
             title,
             work_items: BTreeMap::new(),
             dependencies: BTreeSet::new(),
+            projects: BTreeMap::new(),
+            milestones: BTreeMap::new(),
+            decisions: BTreeMap::new(),
         })
     }
 
@@ -332,6 +389,150 @@ impl Plan {
                         reason,
                     })
                 })
+            })
+            .collect()
+    }
+
+    // Create a project container without duplicating work-item authority
+    pub fn add_project(
+        &mut self,
+        id: ProjectId,
+        title: impl Into<String>,
+    ) -> Result<(), PlanError> {
+        let title = title.into();
+        if title.trim().is_empty() {
+            return Err(PlanError::EmptyText("project title"));
+        }
+        if self.projects.contains_key(&id) {
+            return Err(PlanError::DuplicateProject(id));
+        }
+        self.projects.insert(
+            id.clone(),
+            Project {
+                id,
+                title,
+                milestone_ids: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    // Create a milestone owned by an existing project
+    pub fn add_milestone(
+        &mut self,
+        project_id: &ProjectId,
+        id: MilestoneId,
+        title: impl Into<String>,
+    ) -> Result<(), PlanError> {
+        let title = title.into();
+        if title.trim().is_empty() {
+            return Err(PlanError::EmptyText("milestone title"));
+        }
+        if !self.projects.contains_key(project_id) {
+            return Err(PlanError::ProjectNotFound(project_id.clone()));
+        }
+        if self.milestones.contains_key(&id) {
+            return Err(PlanError::DuplicateMilestone(id));
+        }
+        self.milestones.insert(
+            id.clone(),
+            Milestone {
+                id: id.clone(),
+                project_id: project_id.clone(),
+                title,
+                work_item_ids: BTreeSet::new(),
+            },
+        );
+        self.projects
+            .get_mut(project_id)
+            .expect("project was validated above")
+            .milestone_ids
+            .push(id);
+        Ok(())
+    }
+
+    // Link existing work to a milestone while invalidating its proof revision
+    pub fn link_work_item_to_milestone(
+        &mut self,
+        milestone_id: &MilestoneId,
+        work_item_id: &WorkItemId,
+    ) -> Result<(), PlanError> {
+        self.work_item(work_item_id)?;
+        let milestone = self
+            .milestones
+            .get(milestone_id)
+            .ok_or_else(|| PlanError::MilestoneNotFound(milestone_id.clone()))?;
+        if milestone.work_item_ids.contains(work_item_id) {
+            return Err(PlanError::WorkItemAlreadyLinked(work_item_id.clone()));
+        }
+        let impacted = self.impacted_items(work_item_id);
+        self.ensure_revision_capacity(&impacted)?;
+        self.milestones
+            .get_mut(milestone_id)
+            .expect("milestone was validated above")
+            .work_item_ids
+            .insert(work_item_id.clone());
+        self.bump_revisions(&impacted)?;
+        Ok(())
+    }
+
+    // Record an immutable decision inside the plan aggregate
+    pub fn record_decision(
+        &mut self,
+        id: DecisionId,
+        question: impl Into<String>,
+        decision: impl Into<String>,
+        rationale: impl Into<String>,
+    ) -> Result<(), PlanError> {
+        let question = question.into();
+        let decision = decision.into();
+        let rationale = rationale.into();
+        if question.trim().is_empty() {
+            return Err(PlanError::EmptyText("decision question"));
+        }
+        if decision.trim().is_empty() {
+            return Err(PlanError::EmptyText("decision"));
+        }
+        if rationale.trim().is_empty() {
+            return Err(PlanError::EmptyText("decision rationale"));
+        }
+        if self.decisions.contains_key(&id) {
+            return Err(PlanError::DuplicateDecision(id));
+        }
+        self.decisions.insert(
+            id.clone(),
+            Decision {
+                id,
+                question,
+                decision,
+                rationale,
+            },
+        );
+        Ok(())
+    }
+
+    // Derive milestone progress from the authoritative work-item statuses
+    pub fn milestone_summaries(&self) -> Vec<MilestoneSummary> {
+        self.milestones
+            .values()
+            .map(|milestone| {
+                let total_work_items = milestone.work_item_ids.len();
+                let completed_work_items = milestone
+                    .work_item_ids
+                    .iter()
+                    .filter(|id| {
+                        self.work_item(id)
+                            .is_ok_and(|item| item.status == WorkItemStatus::Completed)
+                    })
+                    .count();
+                MilestoneSummary {
+                    id: milestone.id.clone(),
+                    project_id: milestone.project_id.clone(),
+                    title: milestone.title.clone(),
+                    total_work_items,
+                    completed_work_items,
+                    complete: total_work_items > 0 && completed_work_items == total_work_items,
+                }
             })
             .collect()
     }
@@ -991,7 +1192,16 @@ mod tests {
         };
     }
 
-    impl_from_id!(PlanId, WorkItemId, CriterionId, VerificationId, EvidenceId);
+    impl_from_id!(
+        PlanId,
+        WorkItemId,
+        CriterionId,
+        VerificationId,
+        EvidenceId,
+        ProjectId,
+        MilestoneId,
+        DecisionId
+    );
 
     fn evidence() -> EvidenceRef {
         EvidenceRef::new(
@@ -1452,6 +1662,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn project_milestone_decision_slice_is_derived_and_persistent() {
+        let mut plan = Plan::new(id("plan-structure"), "Structured plan").expect("plan is valid");
+        let work: WorkItemId = id("work-structure");
+        plan.add_work_item(work.clone(), "Complete structured work")
+            .expect("work is valid");
+        let criterion: CriterionId = id("criterion-structure");
+        plan.add_criterion(&work, criterion.clone(), "Work is proven")
+            .expect("criterion is valid");
+        let project: ProjectId = id("project-1");
+        let milestone: MilestoneId = id("milestone-1");
+        plan.add_project(project.clone(), "Suite foundation")
+            .expect("project is valid");
+        plan.add_milestone(&project, milestone.clone(), "Verified foundation")
+            .expect("milestone is valid");
+        plan.link_work_item_to_milestone(&milestone, &work)
+            .expect("work links");
+        plan.record_decision(
+            id("decision-1"),
+            "Where does milestone completion come from?",
+            "From work-item status",
+            "Work items remain the single completion authority",
+        )
+        .expect("decision is valid");
+
+        let incomplete = plan.milestone_summaries();
+        assert_eq!(incomplete[0].total_work_items, 1);
+        assert_eq!(incomplete[0].completed_work_items, 0);
+        assert!(!incomplete[0].complete);
+        let revision = plan.work_item(&work).expect("work exists").revision;
+        plan.record_verification(
+            &work,
+            VerificationInput {
+                id: id("verification-structure"),
+                criterion_id: criterion,
+                subject_revision: revision,
+                evidence: vec![evidence()],
+                result: VerificationResult::Pass,
+                verifier: "test".to_owned(),
+            },
+        )
+        .expect("verification is valid");
+        plan.complete(&work).expect("work completes");
+        let complete = plan.milestone_summaries();
+        assert!(complete[0].complete);
+        assert_eq!(complete[0].completed_work_items, 1);
+
+        let mut store = PlanStore::open_in_memory().expect("store opens");
+        store.save(&plan).expect("structured plan saves");
+        let restored = store.load(plan.id()).expect("structured plan loads");
+        assert_eq!(restored, plan);
+        assert!(restored.milestone_summaries()[0].complete);
     }
 
     #[test]
