@@ -8,7 +8,7 @@ use mg_plan::{
 };
 
 fn usage() -> &'static str {
-    "usage:\n  mg-plan create <db> <plan-id> <title>\n  mg-plan show <db> <plan-id>\n  mg-plan export <db> <plan-id>\n  mg-plan import <db> <json-file>\n  mg-plan add-work <db> <plan-id> <work-id> <title>\n  mg-plan add-dependency <db> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <db> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <db> <plan-id> <work-id>\n  mg-plan revise <db> <plan-id> <work-id> <title>\n  mg-plan verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <db> <plan-id> <work-id>"
+    "usage:\n  mg-plan create <db> <plan-id> <title>\n  mg-plan show <db> <plan-id>\n  mg-plan export <db> <plan-id>\n  mg-plan import <db> <json-file>\n  mg-plan add-work <db> <plan-id> <work-id> <title>\n  mg-plan add-dependency <db> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <db> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <db> <plan-id> <work-id>\n  mg-plan revise <db> <plan-id> <work-id> <title>\n  mg-plan verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <db> <plan-id> <work-id>\n  mg-plan list-work <db> <plan-id>\n  mg-plan blocked <db> <plan-id>\n  mg-plan verification-gaps <db> <plan-id>"
 }
 
 fn plan_id(value: String) -> Result<PlanId, String> {
@@ -204,6 +204,17 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             store
                 .save_if_revision(&plan, revision)
                 .map_err(|error| error.to_string())?;
+        }
+        "list-work" | "blocked" | "verification-gaps" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let (_, plan, _) = load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
+            let document = match command.as_str() {
+                "list-work" => serde_json::to_string_pretty(&plan.work_item_summaries()),
+                "blocked" => serde_json::to_string_pretty(&plan.blocked_work_item_summaries()),
+                _ => serde_json::to_string_pretty(&plan.verification_gaps()),
+            }
+            .map_err(|_| "could not serialize query result".to_owned())?;
+            println!("{document}");
         }
         "help" | "--help" | "-h" => println!("{}", usage()),
         _ => return Err(usage().to_owned()),

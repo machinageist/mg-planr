@@ -36,6 +36,9 @@ cargo run -- start|block|unblock <db> <plan-id> <work-id>
 cargo run -- revise <db> <plan-id> <work-id> <title>
 cargo run -- verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>
 cargo run -- complete <db> <plan-id> <work-id>
+cargo run -- list-work <db> <plan-id>
+cargo run -- blocked <db> <plan-id>
+cargo run -- verification-gaps <db> <plan-id>
 ```
 
 Mutation commands load the authoritative aggregate and its SQLite revision, apply domain
@@ -43,6 +46,10 @@ validation, and save only through an optimistic revision check. A stale writer r
 revision conflict and cannot overwrite newer state. Every successful create or mutation adds
 an immutable aggregate snapshot to `mutation_history`. Evidence remains producer-owned; the
 CLI stores references and revision-pinned verification records rather than raw evidence.
+
+The query commands are read-only projections. `list-work` returns stable summaries ordered by
+identifier; `blocked` filters explicit blocked state; `verification-gaps` reports one typed gap
+per criterion whose latest proof is missing, non-passing, stale, or missing evidence.
 
 ## Current non-goals
 

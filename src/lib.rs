@@ -158,6 +158,30 @@ pub struct WorkItem {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkItemSummary {
+    pub id: WorkItemId,
+    pub title: String,
+    pub status: WorkItemStatus,
+    pub revision: u64,
+    pub criteria_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum VerificationGapReason {
+    MissingVerification,
+    NonPassingVerification,
+    StaleVerification,
+    MissingEvidence,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VerificationGap {
+    pub work_item_id: WorkItemId,
+    pub criterion_id: CriterionId,
+    pub reason: VerificationGapReason,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Plan {
     id: PlanId,
     title: String,
@@ -259,6 +283,57 @@ impl Plan {
     // Return the validated plan title
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    // Return deterministic compact summaries for projection clients
+    pub fn work_item_summaries(&self) -> Vec<WorkItemSummary> {
+        self.work_items
+            .values()
+            .map(|item| WorkItemSummary {
+                id: item.id.clone(),
+                title: item.title.clone(),
+                status: item.status,
+                revision: item.revision,
+                criteria_count: item.criteria.len(),
+            })
+            .collect()
+    }
+
+    // Return only explicitly blocked work in stable identifier order
+    pub fn blocked_work_item_summaries(&self) -> Vec<WorkItemSummary> {
+        self.work_item_summaries()
+            .into_iter()
+            .filter(|item| item.status == WorkItemStatus::Blocked)
+            .collect()
+    }
+
+    // Explain every criterion that cannot currently prove completion
+    pub fn verification_gaps(&self) -> Vec<VerificationGap> {
+        self.work_items
+            .values()
+            .flat_map(|item| {
+                item.criteria.iter().filter_map(|criterion| {
+                    let reason = match criterion.verifications.last() {
+                        None => VerificationGapReason::MissingVerification,
+                        Some(verification) if verification.evidence.is_empty() => {
+                            VerificationGapReason::MissingEvidence
+                        }
+                        Some(verification) if verification.subject_revision != item.revision => {
+                            VerificationGapReason::StaleVerification
+                        }
+                        Some(verification) if verification.result != VerificationResult::Pass => {
+                            VerificationGapReason::NonPassingVerification
+                        }
+                        Some(_) => return None,
+                    };
+                    Some(VerificationGap {
+                        work_item_id: item.id.clone(),
+                        criterion_id: criterion.id.clone(),
+                        reason,
+                    })
+                })
+            })
+            .collect()
     }
 
     // Add a planned work item
@@ -1288,6 +1363,94 @@ mod tests {
         assert_eq!(
             plan.complete(&work),
             Err(PlanError::CriterionIncomplete(criterion))
+        );
+    }
+
+    #[test]
+    fn query_projections_are_deterministic_and_explain_gaps() {
+        let mut plan = Plan::new(id("plan-queries"), "Query plan").expect("plan is valid");
+        let blocked: WorkItemId = id("blocked");
+        let missing: WorkItemId = id("missing");
+        let failing: WorkItemId = id("failing");
+        let stale: WorkItemId = id("stale");
+        for (work, title) in [
+            (blocked.clone(), "Blocked"),
+            (missing.clone(), "Missing"),
+            (failing.clone(), "Failing"),
+            (stale.clone(), "Stale"),
+        ] {
+            plan.add_work_item(work, title).expect("work is valid");
+        }
+        plan.block_work(&blocked).expect("work blocks");
+        plan.add_criterion(&missing, id("missing-criterion"), "Missing proof")
+            .expect("criterion is valid");
+        let failing_criterion: CriterionId = id("failing-criterion");
+        plan.add_criterion(&failing, failing_criterion.clone(), "Failing proof")
+            .expect("criterion is valid");
+        plan.record_verification(
+            &failing,
+            VerificationInput {
+                id: id("failing-verification"),
+                criterion_id: failing_criterion,
+                subject_revision: 2,
+                evidence: vec![evidence()],
+                result: VerificationResult::Fail,
+                verifier: "test".to_owned(),
+            },
+        )
+        .expect("verification is valid");
+        let stale_criterion: CriterionId = id("stale-criterion");
+        plan.add_criterion(&stale, stale_criterion.clone(), "Stale proof")
+            .expect("criterion is valid");
+        plan.record_verification(
+            &stale,
+            VerificationInput {
+                id: id("stale-verification"),
+                criterion_id: stale_criterion.clone(),
+                subject_revision: 2,
+                evidence: vec![evidence()],
+                result: VerificationResult::Pass,
+                verifier: "test".to_owned(),
+            },
+        )
+        .expect("verification is valid");
+        plan.revise_work_item(&stale, "Revised stale work")
+            .expect("revision is valid");
+
+        let summaries = plan.work_item_summaries();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["blocked", "failing", "missing", "stale"]
+        );
+        assert_eq!(
+            plan.blocked_work_item_summaries()
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["blocked"]
+        );
+        assert_eq!(
+            plan.verification_gaps(),
+            vec![
+                VerificationGap {
+                    work_item_id: id("failing"),
+                    criterion_id: id("failing-criterion"),
+                    reason: VerificationGapReason::NonPassingVerification,
+                },
+                VerificationGap {
+                    work_item_id: id("missing"),
+                    criterion_id: id("missing-criterion"),
+                    reason: VerificationGapReason::MissingVerification,
+                },
+                VerificationGap {
+                    work_item_id: id("stale"),
+                    criterion_id: id("stale-criterion"),
+                    reason: VerificationGapReason::StaleVerification,
+                },
+            ]
         );
     }
 
