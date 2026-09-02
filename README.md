@@ -29,7 +29,18 @@ cargo run -- create <db> <plan-id> <title>
 cargo run -- show <db> <plan-id>
 cargo run -- export <db> <plan-id>
 cargo run -- import <db> <json-file>
+cargo run -- add-work <db> <plan-id> <work-id> <title>
+cargo run -- add-dependency <db> <plan-id> <dependent-id> <prerequisite-id>
+cargo run -- add-criterion <db> <plan-id> <work-id> <criterion-id> <statement>
+cargo run -- start|block|unblock <db> <plan-id> <work-id>
+cargo run -- revise <db> <plan-id> <work-id> <title>
+cargo run -- verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>
+cargo run -- complete <db> <plan-id> <work-id>
 ```
+
+Mutation commands load the authoritative aggregate, apply domain validation, and save only
+successful mutations. Evidence remains producer-owned; the CLI stores references and
+revision-pinned verification records rather than raw evidence.
 
 ## Current non-goals
 
