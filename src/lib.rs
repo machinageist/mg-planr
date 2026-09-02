@@ -614,12 +614,30 @@ pub struct PlanStore {
     connection: Connection,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredPlan {
+    pub plan: Plan,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationRecord {
+    pub revision: u64,
+    pub document_json: String,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Sql(rusqlite::Error),
     Json(serde_json::Error),
     InvalidStoredPlan,
     PlanNotFound(PlanId),
+    RevisionConflict {
+        id: PlanId,
+        expected: u64,
+        actual: u64,
+    },
+    RevisionOverflow,
 }
 
 impl fmt::Display for StoreError {
@@ -630,6 +648,15 @@ impl fmt::Display for StoreError {
             Self::Json(_) => formatter.write_str("plan document is invalid"),
             Self::InvalidStoredPlan => formatter.write_str("stored plan identity is invalid"),
             Self::PlanNotFound(id) => write!(formatter, "plan not found: {id}"),
+            Self::RevisionConflict {
+                id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "revision conflict for {id}: expected {expected}, actual {actual}"
+            ),
+            Self::RevisionOverflow => formatter.write_str("plan revision overflow"),
         }
     }
 }
@@ -677,35 +704,145 @@ impl PlanStore {
              CREATE TABLE IF NOT EXISTS plans (
                  id TEXT PRIMARY KEY NOT NULL,
                  title TEXT NOT NULL,
-                 document_json TEXT NOT NULL
+                 document_json TEXT NOT NULL,
+                 revision INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE IF NOT EXISTS mutation_history (
+                 plan_id TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 document_json TEXT NOT NULL,
+                 PRIMARY KEY (plan_id, revision)
              );
              INSERT OR IGNORE INTO schema_migrations (version) VALUES (1);",
         )?;
+        let has_revision = self
+            .connection
+            .prepare("PRAGMA table_info(plans)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "revision");
+        if !has_revision {
+            self.connection.execute(
+                "ALTER TABLE plans ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO mutation_history (plan_id, revision, document_json)
+             SELECT id, revision, document_json FROM plans",
+            [],
+        )?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)",
+            [],
+        )?;
         Ok(())
     }
 
-    // Replace one plan atomically after serializing its complete aggregate
-    pub fn save(&mut self, plan: &Plan) -> Result<(), StoreError> {
+    // Create a plan and its initial immutable history record
+    pub fn create(&mut self, plan: &Plan) -> Result<StoredPlan, StoreError> {
         let document = serde_json::to_string(plan)?;
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO plans (id, title, document_json) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET title = excluded.title,
-             document_json = excluded.document_json",
+        let inserted = transaction.execute(
+            "INSERT INTO plans (id, title, document_json, revision) VALUES (?1, ?2, ?3, 1)",
             params![plan.id.as_str(), plan.title, document],
+        );
+        if let Err(rusqlite::Error::SqliteFailure(error, _)) = inserted {
+            if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY {
+                return Err(StoreError::RevisionConflict {
+                    id: plan.id.clone(),
+                    expected: 0,
+                    actual: 1,
+                });
+            }
+            inserted?;
+        } else {
+            inserted?;
+        }
+        transaction.execute(
+            "INSERT INTO mutation_history (plan_id, revision, document_json) VALUES (?1, 1, ?2)",
+            params![plan.id.as_str(), document],
         )?;
         transaction.commit()?;
+        Ok(StoredPlan {
+            plan: plan.clone(),
+            revision: 1,
+        })
+    }
+
+    // Compatibility save that serializes against the current database revision
+    pub fn save(&mut self, plan: &Plan) -> Result<(), StoreError> {
+        match self.load_versioned(plan.id()) {
+            Ok(stored) => {
+                self.save_if_revision(plan, stored.revision)?;
+            }
+            Err(StoreError::PlanNotFound(_)) => {
+                self.create(plan)?;
+            }
+            Err(error) => return Err(error),
+        }
         Ok(())
     }
 
-    // Load and validate one complete plan aggregate
-    pub fn load(&self, id: &PlanId) -> Result<Plan, StoreError> {
-        let document: String = self
+    // Replace a plan only if the caller still owns the observed revision
+    pub fn save_if_revision(
+        &mut self,
+        plan: &Plan,
+        expected_revision: u64,
+    ) -> Result<StoredPlan, StoreError> {
+        let document = serde_json::to_string(plan)?;
+        let transaction = self.connection.transaction()?;
+        let actual: u64 = transaction
+            .query_row(
+                "SELECT revision FROM plans WHERE id = ?1",
+                params![plan.id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::PlanNotFound(plan.id.clone()),
+                other => StoreError::Sql(other),
+            })?;
+        if actual != expected_revision {
+            return Err(StoreError::RevisionConflict {
+                id: plan.id.clone(),
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let revision = expected_revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionOverflow)?;
+        transaction.execute(
+            "UPDATE plans SET title = ?1, document_json = ?2, revision = ?3
+             WHERE id = ?4 AND revision = ?5",
+            params![
+                plan.title,
+                document,
+                revision,
+                plan.id.as_str(),
+                expected_revision
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO mutation_history (plan_id, revision, document_json) VALUES (?1, ?2, ?3)",
+            params![plan.id.as_str(), revision, document],
+        )?;
+        transaction.commit()?;
+        Ok(StoredPlan {
+            plan: plan.clone(),
+            revision,
+        })
+    }
+
+    // Load and validate one complete plan aggregate with its store revision
+    pub fn load_versioned(&self, id: &PlanId) -> Result<StoredPlan, StoreError> {
+        let (document, revision): (String, u64) = self
             .connection
             .query_row(
-                "SELECT document_json FROM plans WHERE id = ?1",
+                "SELECT document_json, revision FROM plans WHERE id = ?1",
                 params![id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| match error {
                 rusqlite::Error::QueryReturnedNoRows => StoreError::PlanNotFound(id.clone()),
@@ -715,7 +852,32 @@ impl PlanStore {
         if plan.id() != id {
             return Err(StoreError::InvalidStoredPlan);
         }
-        Ok(plan)
+        Ok(StoredPlan { plan, revision })
+    }
+
+    // Load one complete plan without exposing its persistence revision
+    pub fn load(&self, id: &PlanId) -> Result<Plan, StoreError> {
+        Ok(self.load_versioned(id)?.plan)
+    }
+
+    // Read the append-only aggregate history for audit and recovery
+    pub fn history(&self, id: &PlanId) -> Result<Vec<MutationRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT revision, document_json FROM mutation_history
+             WHERE plan_id = ?1 ORDER BY revision",
+        )?;
+        let records = statement
+            .query_map(params![id.as_str()], |row| {
+                Ok(MutationRecord {
+                    revision: row.get(0)?,
+                    document_json: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if records.is_empty() && self.load_versioned(id).is_err() {
+            return Err(StoreError::PlanNotFound(id.clone()));
+        }
+        Ok(records)
     }
 
     // Export one plan as a portable versioned-domain document
@@ -1127,6 +1289,60 @@ mod tests {
             plan.complete(&work),
             Err(PlanError::CriterionIncomplete(criterion))
         );
+    }
+
+    #[test]
+    fn stale_writer_is_rejected_and_history_is_append_only() {
+        let path = std::env::temp_dir().join(format!(
+            "mg-plan-conflict-{}-{}.sqlite",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        let plan = Plan::new(id("plan-conflict"), "Conflict plan").expect("plan is valid");
+        let mut initial = PlanStore::open(&path).expect("store opens");
+        initial.create(&plan).expect("plan creates");
+        drop(initial);
+
+        let first = PlanStore::open(&path).expect("first writer opens");
+        let second = PlanStore::open(&path).expect("second writer opens");
+        let first_loaded = first.load_versioned(plan.id()).expect("first reads");
+        let second_loaded = second.load_versioned(plan.id()).expect("second reads");
+        assert_eq!(first_loaded.revision, 1);
+        assert_eq!(second_loaded.revision, 1);
+
+        let mut first_plan = first_loaded.plan;
+        first_plan
+            .revise_work_item(&id("missing-work"), "irrelevant")
+            .expect_err("missing work is rejected");
+        let first_saved = Plan::new(id("plan-conflict"), "First writer").expect("plan is valid");
+        let mut first = first;
+        let saved = first
+            .save_if_revision(&first_saved, first_loaded.revision)
+            .expect("first writer saves");
+        assert_eq!(saved.revision, 2);
+
+        let second_plan = Plan::new(id("plan-conflict"), "Stale writer").expect("plan is valid");
+        let mut second = second;
+        assert!(matches!(
+            second.save_if_revision(&second_plan, second_loaded.revision),
+            Err(StoreError::RevisionConflict {
+                id,
+                expected: 1,
+                actual: 2,
+            }) if id == PlanId::new("plan-conflict").expect("plan id is valid")
+        ));
+        let history = first.history(plan.id()).expect("history reads");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].revision, 1);
+        assert_eq!(history[1].revision, 2);
+        assert_eq!(
+            first.load(plan.id()).expect("current plan loads").title(),
+            "First writer"
+        );
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

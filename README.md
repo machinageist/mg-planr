@@ -38,9 +38,11 @@ cargo run -- verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <s
 cargo run -- complete <db> <plan-id> <work-id>
 ```
 
-Mutation commands load the authoritative aggregate, apply domain validation, and save only
-successful mutations. Evidence remains producer-owned; the CLI stores references and
-revision-pinned verification records rather than raw evidence.
+Mutation commands load the authoritative aggregate and its SQLite revision, apply domain
+validation, and save only through an optimistic revision check. A stale writer receives a
+revision conflict and cannot overwrite newer state. Every successful create or mutation adds
+an immutable aggregate snapshot to `mutation_history`. Evidence remains producer-owned; the
+CLI stores references and revision-pinned verification records rather than raw evidence.
 
 ## Current non-goals
 

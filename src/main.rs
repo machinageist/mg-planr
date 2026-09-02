@@ -43,11 +43,13 @@ fn result(value: String) -> Result<VerificationResult, String> {
     }
 }
 
-fn load_plan(db: String, id: String) -> Result<(PlanStore, Plan), String> {
+fn load_plan(db: String, id: String) -> Result<(PlanStore, Plan, u64), String> {
     let id = plan_id(id)?;
     let store = PlanStore::open(db).map_err(|error| error.to_string())?;
-    let plan = store.load(&id).map_err(|error| error.to_string())?;
-    Ok((store, plan))
+    let stored = store
+        .load_versioned(&id)
+        .map_err(|error| error.to_string())?;
+    Ok((store, stored.plan, stored.revision))
 }
 
 fn domain(error: PlanError) -> String {
@@ -64,7 +66,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             let title = args.collect::<Vec<_>>().join(" ");
             let plan = Plan::new(id, title).map_err(domain)?;
             let mut store = PlanStore::open(db).map_err(|error| error.to_string())?;
-            store.save(&plan).map_err(|error| error.to_string())?;
+            store.create(&plan).map_err(|error| error.to_string())?;
             println!("{}", plan.id());
         }
         "show" | "export" => {
@@ -91,27 +93,31 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         }
         "add-work" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
-            let (mut store, mut plan) =
+            let (mut store, mut plan, revision) =
                 load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
             let id = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             let title = args.collect::<Vec<_>>().join(" ");
             plan.add_work_item(id.clone(), title).map_err(domain)?;
-            store.save(&plan).map_err(|error| error.to_string())?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
             println!("{}", id);
         }
         "add-dependency" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
-            let (mut store, mut plan) =
+            let (mut store, mut plan, revision) =
                 load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
             let dependent = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             let prerequisite = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             plan.add_dependency(&dependent, &prerequisite)
                 .map_err(domain)?;
-            store.save(&plan).map_err(|error| error.to_string())?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
         }
         "add-criterion" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
-            let (mut store, mut plan) =
+            let (mut store, mut plan, revision) =
                 load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
             let work = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             let criterion =
@@ -120,11 +126,13 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             let statement = args.collect::<Vec<_>>().join(" ");
             plan.add_criterion(&work, criterion, statement)
                 .map_err(domain)?;
-            store.save(&plan).map_err(|error| error.to_string())?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
         }
         "start" | "block" | "unblock" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
-            let (mut store, mut plan) =
+            let (mut store, mut plan, revision) =
                 load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
             let work = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             match command.as_str() {
@@ -133,20 +141,24 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
                 _ => plan.unblock_work(&work),
             }
             .map_err(domain)?;
-            store.save(&plan).map_err(|error| error.to_string())?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
         }
         "revise" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
-            let (mut store, mut plan) =
+            let (mut store, mut plan, revision) =
                 load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
             let work = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             let title = args.collect::<Vec<_>>().join(" ");
             plan.revise_work_item(&work, title).map_err(domain)?;
-            store.save(&plan).map_err(|error| error.to_string())?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
         }
         "verify" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
-            let (mut store, mut plan) =
+            let (mut store, mut plan, revision) =
                 load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
             let work = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             let verification = verification_id(args.next().ok_or_else(|| usage().to_owned())?)?;
@@ -179,15 +191,19 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
                 },
             )
             .map_err(domain)?;
-            store.save(&plan).map_err(|error| error.to_string())?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
         }
         "complete" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
-            let (mut store, mut plan) =
+            let (mut store, mut plan, revision) =
                 load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
             let work = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             plan.complete(&work).map_err(domain)?;
-            store.save(&plan).map_err(|error| error.to_string())?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
         }
         "help" | "--help" | "-h" => println!("{}", usage()),
         _ => return Err(usage().to_owned()),
