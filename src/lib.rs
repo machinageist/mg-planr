@@ -1,7 +1,7 @@
 // Author: Jeff
 // Date: 2026-09-01
 // Description: Durable commitment and verification kernel for mg-plan
-// Notes: SQLite persistence is local-first; cross-application transport is deferred
+// Notes: SQLite persistence is local-first; scheduling uses explicit calr request/receipt references
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -49,6 +49,8 @@ define_id!(EvidenceId);
 define_id!(ProjectId);
 define_id!(MilestoneId);
 define_id!(DecisionId);
+define_id!(ScheduleRequestId);
+define_id!(CalendarEventId);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum WorkItemStatus {
@@ -218,6 +220,41 @@ pub struct MilestoneSummary {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScheduleRequest {
+    pub id: ScheduleRequestId,
+    pub work_item_id: WorkItemId,
+    pub work_item_revision: u64,
+    pub calendar: String,
+    pub requested_start: String,
+    pub duration_minutes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScheduleReceipt {
+    pub request_id: ScheduleRequestId,
+    pub event_id: CalendarEventId,
+    pub calendar: String,
+    pub event_revision: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ScheduleGapReason {
+    MissingReceipt,
+    StaleWorkRevision,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScheduleSummary {
+    pub request_id: ScheduleRequestId,
+    pub work_item_id: WorkItemId,
+    pub calendar: String,
+    pub requested_start: String,
+    pub duration_minutes: u64,
+    pub receipt: Option<ScheduleReceipt>,
+    pub gap: Option<ScheduleGapReason>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Plan {
     id: PlanId,
     title: String,
@@ -229,6 +266,10 @@ pub struct Plan {
     milestones: BTreeMap<MilestoneId, Milestone>,
     #[serde(default)]
     decisions: BTreeMap<DecisionId, Decision>,
+    #[serde(default)]
+    schedule_requests: BTreeMap<ScheduleRequestId, ScheduleRequest>,
+    #[serde(default)]
+    schedule_receipts: BTreeMap<ScheduleRequestId, ScheduleReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -265,6 +306,11 @@ pub enum PlanError {
     ProjectNotFound(ProjectId),
     MilestoneNotFound(MilestoneId),
     WorkItemAlreadyLinked(WorkItemId),
+    DuplicateScheduleRequest(ScheduleRequestId),
+    ScheduleRequestNotFound(ScheduleRequestId),
+    ScheduleReceiptAlreadyRecorded(ScheduleRequestId),
+    ScheduleCalendarMismatch,
+    InvalidScheduleDuration,
 }
 
 impl fmt::Display for PlanError {
@@ -308,6 +354,21 @@ impl fmt::Display for PlanError {
             Self::ProjectNotFound(id) => write!(formatter, "project not found: {id}"),
             Self::MilestoneNotFound(id) => write!(formatter, "milestone not found: {id}"),
             Self::WorkItemAlreadyLinked(id) => write!(formatter, "work item already linked: {id}"),
+            Self::DuplicateScheduleRequest(id) => {
+                write!(formatter, "schedule request already exists: {id}")
+            }
+            Self::ScheduleRequestNotFound(id) => {
+                write!(formatter, "schedule request not found: {id}")
+            }
+            Self::ScheduleReceiptAlreadyRecorded(id) => {
+                write!(formatter, "schedule receipt already recorded: {id}")
+            }
+            Self::ScheduleCalendarMismatch => {
+                formatter.write_str("schedule calendar does not match request")
+            }
+            Self::InvalidScheduleDuration => {
+                formatter.write_str("schedule duration must be positive")
+            }
         }
     }
 }
@@ -329,6 +390,8 @@ impl Plan {
             projects: BTreeMap::new(),
             milestones: BTreeMap::new(),
             decisions: BTreeMap::new(),
+            schedule_requests: BTreeMap::new(),
+            schedule_receipts: BTreeMap::new(),
         })
     }
 
@@ -389,6 +452,110 @@ impl Plan {
                         reason,
                     })
                 })
+            })
+            .collect()
+    }
+
+    // Create a revision-pinned request for the calendar authority
+    pub fn request_schedule(
+        &mut self,
+        id: ScheduleRequestId,
+        work_item_id: &WorkItemId,
+        calendar: impl Into<String>,
+        requested_start: impl Into<String>,
+        duration_minutes: u64,
+    ) -> Result<(), PlanError> {
+        let work_item_revision = self.work_item(work_item_id)?.revision;
+        let calendar = calendar.into();
+        let requested_start = requested_start.into();
+        if calendar.trim().is_empty() {
+            return Err(PlanError::EmptyText("schedule calendar"));
+        }
+        if requested_start.trim().is_empty() {
+            return Err(PlanError::EmptyText("schedule start"));
+        }
+        if duration_minutes == 0 {
+            return Err(PlanError::InvalidScheduleDuration);
+        }
+        if self.schedule_requests.contains_key(&id) {
+            return Err(PlanError::DuplicateScheduleRequest(id));
+        }
+        self.schedule_requests.insert(
+            id.clone(),
+            ScheduleRequest {
+                id,
+                work_item_id: work_item_id.clone(),
+                work_item_revision,
+                calendar,
+                requested_start,
+                duration_minutes,
+            },
+        );
+        Ok(())
+    }
+
+    // Record calr's receipt without copying or owning the calendar event
+    pub fn record_schedule_receipt(
+        &mut self,
+        request_id: &ScheduleRequestId,
+        event_id: CalendarEventId,
+        calendar: impl Into<String>,
+        event_revision: impl Into<String>,
+    ) -> Result<(), PlanError> {
+        let request = self
+            .schedule_requests
+            .get(request_id)
+            .ok_or_else(|| PlanError::ScheduleRequestNotFound(request_id.clone()))?;
+        if self.schedule_receipts.contains_key(request_id) {
+            return Err(PlanError::ScheduleReceiptAlreadyRecorded(
+                request_id.clone(),
+            ));
+        }
+        let calendar = calendar.into();
+        let event_revision = event_revision.into();
+        if calendar != request.calendar {
+            return Err(PlanError::ScheduleCalendarMismatch);
+        }
+        if event_revision.trim().is_empty() {
+            return Err(PlanError::EmptyText("calendar event revision"));
+        }
+        self.schedule_receipts.insert(
+            request_id.clone(),
+            ScheduleReceipt {
+                request_id: request_id.clone(),
+                event_id,
+                calendar,
+                event_revision,
+            },
+        );
+        Ok(())
+    }
+
+    // Project scheduling intent and receipt state without becoming calr
+    pub fn schedule_summaries(&self) -> Vec<ScheduleSummary> {
+        self.schedule_requests
+            .values()
+            .map(|request| {
+                let receipt = self.schedule_receipts.get(&request.id).cloned();
+                let gap = if self
+                    .work_item(&request.work_item_id)
+                    .is_ok_and(|item| item.revision != request.work_item_revision)
+                {
+                    Some(ScheduleGapReason::StaleWorkRevision)
+                } else if receipt.is_none() {
+                    Some(ScheduleGapReason::MissingReceipt)
+                } else {
+                    None
+                };
+                ScheduleSummary {
+                    request_id: request.id.clone(),
+                    work_item_id: request.work_item_id.clone(),
+                    calendar: request.calendar.clone(),
+                    requested_start: request.requested_start.clone(),
+                    duration_minutes: request.duration_minutes,
+                    receipt,
+                    gap,
+                }
             })
             .collect()
     }
@@ -1200,7 +1367,9 @@ mod tests {
         EvidenceId,
         ProjectId,
         MilestoneId,
-        DecisionId
+        DecisionId,
+        ScheduleRequestId,
+        CalendarEventId
     );
 
     fn evidence() -> EvidenceRef {
@@ -1716,6 +1885,70 @@ mod tests {
         let restored = store.load(plan.id()).expect("structured plan loads");
         assert_eq!(restored, plan);
         assert!(restored.milestone_summaries()[0].complete);
+    }
+
+    #[test]
+    fn scheduling_request_receipt_and_staleness_are_persistent() {
+        let mut plan = Plan::new(id("plan-schedule"), "Scheduling plan").expect("plan is valid");
+        let work: WorkItemId = id("work-schedule");
+        plan.add_work_item(work.clone(), "Schedule this work")
+            .expect("work is valid");
+        let request: ScheduleRequestId = id("request-1");
+        plan.request_schedule(
+            request.clone(),
+            &work,
+            "calr:primary",
+            "2026-09-01T09:00:00Z",
+            60,
+        )
+        .expect("request is valid");
+        assert_eq!(
+            plan.schedule_summaries()[0].gap,
+            Some(ScheduleGapReason::MissingReceipt)
+        );
+        plan.record_schedule_receipt(&request, id("event-1"), "calr:primary", "event-revision-1")
+            .expect("receipt is valid");
+        assert_eq!(plan.schedule_summaries()[0].gap, None);
+        assert_eq!(
+            plan.schedule_summaries()[0]
+                .receipt
+                .as_ref()
+                .expect("receipt exists")
+                .event_id,
+            id("event-1")
+        );
+        assert_eq!(
+            plan.record_schedule_receipt(
+                &request,
+                id("event-2"),
+                "calr:primary",
+                "event-revision-2"
+            ),
+            Err(PlanError::ScheduleReceiptAlreadyRecorded(request.clone()))
+        );
+        let bad_request: ScheduleRequestId = id("request-bad");
+        plan.request_schedule(bad_request, &work, "calr:primary", "later", 30)
+            .expect("second request is valid");
+        assert_eq!(
+            plan.record_schedule_receipt(
+                &id("request-bad"),
+                id("event-bad"),
+                "calr:secondary",
+                "r1"
+            ),
+            Err(PlanError::ScheduleCalendarMismatch)
+        );
+        plan.revise_work_item(&work, "Revised scheduled work")
+            .expect("revision is valid");
+        assert_eq!(
+            plan.schedule_summaries()[0].gap,
+            Some(ScheduleGapReason::StaleWorkRevision)
+        );
+
+        let mut store = PlanStore::open_in_memory().expect("store opens");
+        store.save(&plan).expect("scheduled plan saves");
+        let restored = store.load(plan.id()).expect("scheduled plan loads");
+        assert_eq!(restored.schedule_summaries(), plan.schedule_summaries());
     }
 
     #[test]

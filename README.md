@@ -44,6 +44,9 @@ cargo run -- add-milestone <db> <plan-id> <project-id> <milestone-id> <title>
 cargo run -- link-work <db> <plan-id> <milestone-id> <work-id>
 cargo run -- decide <db> <plan-id> <decision-id> <question> <decision> <rationale>
 cargo run -- milestones <db> <plan-id>
+cargo run -- schedule-request <db> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>
+cargo run -- schedule-receipt <db> <plan-id> <request-id> <event-id> <calendar> <event-revision>
+cargo run -- schedules <db> <plan-id>
 ```
 
 Mutation commands load the authoritative aggregate and its SQLite revision, apply domain
@@ -60,9 +63,14 @@ Projects and milestones organize existing work without owning completion separat
 completion is derived from linked work-item status. Decisions are recorded in the plan as
 rationale-bearing records; they do not mutate work status or replace evidence verification.
 
+Scheduling requests express plan-owned intent pinned to a work revision. mg-calr remains the
+authority for event creation and returns an opaque event reference plus revision receipt.
+`schedules` reports missing receipts and stale work revisions; it does not contact or mutate
+the calendar.
+
 ## Current non-goals
 
-- calendar integration;
+- live calendar adapter or synchronization;
 - Git/CI adapters;
 - synchronization;
 - generalized workflow automation;

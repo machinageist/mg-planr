@@ -8,7 +8,7 @@ use mg_plan::{
 };
 
 fn usage() -> &'static str {
-    "usage:\n  mg-plan create <db> <plan-id> <title>\n  mg-plan show <db> <plan-id>\n  mg-plan export <db> <plan-id>\n  mg-plan import <db> <json-file>\n  mg-plan add-work <db> <plan-id> <work-id> <title>\n  mg-plan add-dependency <db> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <db> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <db> <plan-id> <work-id>\n  mg-plan revise <db> <plan-id> <work-id> <title>\n  mg-plan verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <db> <plan-id> <work-id>\n  mg-plan list-work <db> <plan-id>\n  mg-plan blocked <db> <plan-id>\n  mg-plan verification-gaps <db> <plan-id>\n  mg-plan add-project <db> <plan-id> <project-id> <title>\n  mg-plan add-milestone <db> <plan-id> <project-id> <milestone-id> <title>\n  mg-plan link-work <db> <plan-id> <milestone-id> <work-id>\n  mg-plan decide <db> <plan-id> <decision-id> <question> <decision> <rationale>\n  mg-plan milestones <db> <plan-id>"
+    "usage:\n  mg-plan create <db> <plan-id> <title>\n  mg-plan show <db> <plan-id>\n  mg-plan export <db> <plan-id>\n  mg-plan import <db> <json-file>\n  mg-plan add-work <db> <plan-id> <work-id> <title>\n  mg-plan add-dependency <db> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <db> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <db> <plan-id> <work-id>\n  mg-plan revise <db> <plan-id> <work-id> <title>\n  mg-plan verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <db> <plan-id> <work-id>\n  mg-plan list-work <db> <plan-id>\n  mg-plan blocked <db> <plan-id>\n  mg-plan verification-gaps <db> <plan-id>\n  mg-plan add-project <db> <plan-id> <project-id> <title>\n  mg-plan add-milestone <db> <plan-id> <project-id> <milestone-id> <title>\n  mg-plan link-work <db> <plan-id> <milestone-id> <work-id>\n  mg-plan decide <db> <plan-id> <decision-id> <question> <decision> <rationale>\n  mg-plan milestones <db> <plan-id>\n  mg-plan schedule-request <db> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>\n  mg-plan schedule-receipt <db> <plan-id> <request-id> <event-id> <calendar> <event-revision>\n  mg-plan schedules <db> <plan-id>"
 }
 
 fn plan_id(value: String) -> Result<PlanId, String> {
@@ -204,6 +204,51 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             store
                 .save_if_revision(&plan, revision)
                 .map_err(|error| error.to_string())?;
+        }
+        "schedule-request" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let (mut store, mut plan, revision) =
+                load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
+            let request =
+                mg_plan::ScheduleRequestId::new(args.next().ok_or_else(|| usage().to_owned())?)
+                    .map_err(|error| error.to_string())?;
+            let work = work_id(args.next().ok_or_else(|| usage().to_owned())?)?;
+            let calendar = args.next().ok_or_else(|| usage().to_owned())?;
+            let start = args.next().ok_or_else(|| usage().to_owned())?;
+            let duration = number(args.next().ok_or_else(|| usage().to_owned())?, "duration")?;
+            plan.request_schedule(request.clone(), &work, calendar, start, duration)
+                .map_err(domain)?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
+            println!("{request}");
+        }
+        "schedule-receipt" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let (mut store, mut plan, revision) =
+                load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
+            let request =
+                mg_plan::ScheduleRequestId::new(args.next().ok_or_else(|| usage().to_owned())?)
+                    .map_err(|error| error.to_string())?;
+            let event =
+                mg_plan::CalendarEventId::new(args.next().ok_or_else(|| usage().to_owned())?)
+                    .map_err(|error| error.to_string())?;
+            let calendar = args.next().ok_or_else(|| usage().to_owned())?;
+            let event_revision = args.next().ok_or_else(|| usage().to_owned())?;
+            plan.record_schedule_receipt(&request, event, calendar, event_revision)
+                .map_err(domain)?;
+            store
+                .save_if_revision(&plan, revision)
+                .map_err(|error| error.to_string())?;
+        }
+        "schedules" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let (_, plan, _) = load_plan(db, args.next().ok_or_else(|| usage().to_owned())?)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan.schedule_summaries())
+                    .map_err(|_| "could not serialize schedule result".to_owned())?
+            );
         }
         "add-project" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
