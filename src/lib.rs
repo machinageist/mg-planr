@@ -1130,6 +1130,118 @@ mod tests {
     }
 
     #[test]
+    fn persisted_lifecycle_reopens_downstream_work_after_revision() {
+        let mut plan = Plan::new(id("plan-lifecycle"), "Lifecycle plan").expect("plan is valid");
+        let prerequisite: WorkItemId = id("work-prerequisite");
+        let dependent: WorkItemId = id("work-dependent");
+        let prerequisite_criterion: CriterionId = id("criterion-prerequisite");
+        let dependent_criterion: CriterionId = id("criterion-dependent");
+        plan.add_work_item(prerequisite.clone(), "Establish prerequisite")
+            .expect("work is valid");
+        plan.add_work_item(dependent.clone(), "Complete dependent")
+            .expect("work is valid");
+        plan.add_dependency(&dependent, &prerequisite)
+            .expect("dependency is valid");
+        plan.add_criterion(
+            &prerequisite,
+            prerequisite_criterion.clone(),
+            "Prerequisite is proven",
+        )
+        .expect("criterion is valid");
+        plan.add_criterion(
+            &dependent,
+            dependent_criterion.clone(),
+            "Dependent is proven",
+        )
+        .expect("criterion is valid");
+        let prerequisite_revision = plan
+            .work_item(&prerequisite)
+            .expect("prerequisite exists")
+            .revision;
+        let dependent_revision = plan
+            .work_item(&dependent)
+            .expect("dependent exists")
+            .revision;
+        plan.record_verification(
+            &prerequisite,
+            VerificationInput {
+                id: id("verification-prerequisite"),
+                criterion_id: prerequisite_criterion,
+                subject_revision: prerequisite_revision,
+                evidence: vec![evidence()],
+                result: VerificationResult::Pass,
+                verifier: "test".to_owned(),
+            },
+        )
+        .expect("verification is valid");
+        plan.complete(&prerequisite)
+            .expect("prerequisite completes");
+        plan.record_verification(
+            &dependent,
+            VerificationInput {
+                id: id("verification-dependent"),
+                criterion_id: dependent_criterion,
+                subject_revision: dependent_revision,
+                evidence: vec![evidence()],
+                result: VerificationResult::Pass,
+                verifier: "test".to_owned(),
+            },
+        )
+        .expect("verification is valid");
+        plan.complete(&dependent).expect("dependent completes");
+
+        let path = std::env::temp_dir().join(format!(
+            "mg-plan-lifecycle-{}-{}.sqlite",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = PlanStore::open(&path).expect("store opens");
+        store.save(&plan).expect("completed plan saves");
+        drop(store);
+
+        let mut reopened = PlanStore::open(&path).expect("store reopens");
+        let mut loaded = reopened.load(plan.id()).expect("completed plan loads");
+        assert_eq!(
+            loaded
+                .work_item(&dependent)
+                .expect("dependent exists")
+                .status,
+            WorkItemStatus::Completed
+        );
+        loaded
+            .revise_work_item(&prerequisite, "Revise prerequisite")
+            .expect("revision is valid");
+        assert_eq!(
+            loaded
+                .work_item(&prerequisite)
+                .expect("prerequisite exists")
+                .status,
+            WorkItemStatus::Planned
+        );
+        assert_eq!(
+            loaded
+                .work_item(&dependent)
+                .expect("dependent exists")
+                .status,
+            WorkItemStatus::Planned
+        );
+        reopened.save(&loaded).expect("revised plan saves");
+        drop(reopened);
+
+        let final_store = PlanStore::open(&path).expect("store opens after revision");
+        let final_plan = final_store.load(plan.id()).expect("revised plan loads");
+        assert_eq!(
+            final_plan
+                .work_item(&dependent)
+                .expect("dependent exists")
+                .status,
+            WorkItemStatus::Planned
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn plan_store_round_trips_complete_aggregate_and_json() {
         let mut plan = Plan::new(id("plan-store"), "Persistent plan").expect("plan is valid");
         let work = id("work-store");
