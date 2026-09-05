@@ -1069,10 +1069,30 @@ pub struct MutationRecord {
     pub document_json: String,
 }
 
+const PLAN_INTEROP_SCHEMA: &str = "mg.plan/1";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanEnvelope {
+    pub interop_schema: String,
+    pub kind: String,
+    pub producer: PlanProducer,
+    pub plan_revision: u64,
+    pub plan: Plan,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanProducer {
+    pub app: String,
+    pub app_version: String,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Sql(rusqlite::Error),
     Json(serde_json::Error),
+    InvalidImportEnvelope,
     InvalidStoredPlan,
     PlanNotFound(PlanId),
     RevisionConflict {
@@ -1089,6 +1109,7 @@ impl fmt::Display for StoreError {
         match self {
             Self::Sql(_) => formatter.write_str("plan storage operation failed"),
             Self::Json(_) => formatter.write_str("plan document is invalid"),
+            Self::InvalidImportEnvelope => formatter.write_str("plan import envelope is invalid"),
             Self::InvalidStoredPlan => formatter.write_str("stored plan identity is invalid"),
             Self::PlanNotFound(id) => write!(formatter, "plan not found: {id}"),
             Self::RevisionConflict {
@@ -1323,16 +1344,43 @@ impl PlanStore {
         Ok(records)
     }
 
-    // Export one plan as a portable versioned-domain document
+    // Export one plan as a portable, versioned-domain envelope
     pub fn export_json(&self, id: &PlanId) -> Result<String, StoreError> {
-        Ok(serde_json::to_string_pretty(&self.load(id)?)?)
+        let stored = self.load_versioned(id)?;
+        let envelope = PlanEnvelope {
+            interop_schema: PLAN_INTEROP_SCHEMA.to_owned(),
+            kind: "plan".to_owned(),
+            producer: PlanProducer {
+                app: "mg-plan".to_owned(),
+                app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            },
+            plan_revision: stored.revision,
+            plan: stored.plan,
+        };
+        Ok(serde_json::to_string_pretty(&envelope)?)
     }
 
-    // Validate and atomically import one complete plan document
+    // Validate and atomically import one complete plan envelope
     pub fn import_json(&mut self, document: &str) -> Result<PlanId, StoreError> {
-        let plan: Plan = serde_json::from_str(document)?;
-        let id = plan.id().clone();
-        self.save(&plan)?;
+        let envelope: PlanEnvelope = serde_json::from_str(document)?;
+        if envelope.interop_schema != PLAN_INTEROP_SCHEMA
+            || envelope.kind != "plan"
+            || envelope.producer.app != "mg-plan"
+            || envelope.plan_revision == 0
+        {
+            return Err(StoreError::InvalidImportEnvelope);
+        }
+        let id = envelope.plan.id().clone();
+        match self.load_versioned(&id) {
+            Ok(_) => {
+                self.save_if_revision(&envelope.plan, envelope.plan_revision)?;
+            }
+            Err(StoreError::PlanNotFound(_)) if envelope.plan_revision == 1 => {
+                self.create(&envelope.plan)?;
+            }
+            Err(StoreError::PlanNotFound(_)) => return Err(StoreError::InvalidImportEnvelope),
+            Err(error) => return Err(error),
+        }
         Ok(id)
     }
 }
@@ -2130,9 +2178,27 @@ mod tests {
         assert_eq!(loaded, plan);
 
         let document = store.export_json(plan.id()).expect("plan exports");
+        let envelope: serde_json::Value = serde_json::from_str(&document).expect("envelope parses");
+        assert_eq!(envelope["interop_schema"], "mg.plan/1");
+        assert_eq!(envelope["kind"], "plan");
+        assert_eq!(envelope["plan_revision"], 1);
         let imported_id = store.import_json(&document).expect("plan imports");
         assert_eq!(imported_id, *plan.id());
         assert_eq!(store.load(plan.id()).expect("imported plan loads"), plan);
+
+        let mut stale: serde_json::Value =
+            serde_json::from_str(&document).expect("envelope parses");
+        stale["plan"]["title"] = serde_json::Value::String("stale import".to_owned());
+        assert!(matches!(
+            store.import_json(&serde_json::to_string(&stale).expect("stale envelope serializes")),
+            Err(StoreError::RevisionConflict { .. })
+        ));
+
+        stale["unexpected"] = serde_json::Value::Bool(true);
+        assert!(matches!(
+            store.import_json(&serde_json::to_string(&stale).expect("invalid envelope serializes")),
+            Err(StoreError::Json(_))
+        ));
     }
 
     #[test]

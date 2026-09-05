@@ -47,6 +47,8 @@ cargo run -- milestones <db> <plan-id>
 cargo run -- schedule-request <db> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>
 cargo run -- schedule-receipt <db> <plan-id> <request-id> <event-id> <calendar> <event-revision>
 cargo run -- schedules <db> <plan-id>
+cargo run -- export <db> <plan-id>        # mg.plan/1 envelope
+cargo run -- import <db> <json-file>      # revision-checked import
 ```
 
 Mutation commands load the authoritative aggregate and its SQLite revision, apply domain
@@ -58,6 +60,11 @@ CLI stores references and revision-pinned verification records rather than raw e
 The query commands are read-only projections. `list-work` returns stable summaries ordered by
 identifier; `blocked` filters explicit blocked state; `verification-gaps` reports one typed gap
 per criterion whose latest proof is missing, non-passing, stale, or missing evidence.
+
+Exports are `mg.plan/1` envelopes containing producer identity, the exact aggregate revision,
+and the complete plan. Imports reject unknown envelope fields, wrong schema/producers, and
+revision-zero documents; existing plans are replaced only when the imported revision matches
+the current stored revision, while new plans must begin at revision one.
 
 Projects and milestones organize existing work without owning completion separately. Milestone
 completion is derived from linked work-item status. Decisions are recorded in the plan as
