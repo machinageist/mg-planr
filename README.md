@@ -9,8 +9,8 @@ mg-plan owns the commitment-to-proof path for the suite:
 - revision-pinned verification attempts;
 - completion only after every criterion passes.
 
-The current slice persists each complete plan aggregate in SQLite and exposes a narrow CLI.
-SQLite is the local durable authority; JSON is the portable export/import envelope. mg-plan
+The current slice persists each complete plan aggregate in PostgreSQL and exposes a narrow CLI.
+PostgreSQL is the local durable authority; JSON is the portable export/import envelope. mg-plan
 does not own calendar events, repositories, CI runs, raw evidence, or cross-application
 databases. Those integrate through explicit versioned references and receipts in later slices.
 
@@ -25,33 +25,33 @@ cargo clippy --all-targets --all-features -- -D warnings
 ## CLI
 
 ```text
-cargo run -- create <db> <plan-id> <title>
-cargo run -- show <db> <plan-id>
-cargo run -- export <db> <plan-id>
-cargo run -- import <db> <json-file>
-cargo run -- add-work <db> <plan-id> <work-id> <title>
-cargo run -- add-dependency <db> <plan-id> <dependent-id> <prerequisite-id>
-cargo run -- add-criterion <db> <plan-id> <work-id> <criterion-id> <statement>
-cargo run -- start|block|unblock <db> <plan-id> <work-id>
-cargo run -- revise <db> <plan-id> <work-id> <title>
-cargo run -- verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>
-cargo run -- complete <db> <plan-id> <work-id>
-cargo run -- list-work <db> <plan-id>
-cargo run -- blocked <db> <plan-id>
-cargo run -- verification-gaps <db> <plan-id>
-cargo run -- add-project <db> <plan-id> <project-id> <title>
-cargo run -- add-milestone <db> <plan-id> <project-id> <milestone-id> <title>
-cargo run -- link-work <db> <plan-id> <milestone-id> <work-id>
-cargo run -- decide <db> <plan-id> <decision-id> <question> <decision> <rationale>
-cargo run -- milestones <db> <plan-id>
-cargo run -- schedule-request <db> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>
-cargo run -- schedule-receipt <db> <plan-id> <request-id> <event-id> <calendar> <event-revision>
-cargo run -- schedules <db> <plan-id>
-cargo run -- export <db> <plan-id>        # mg.plan/1 envelope
-cargo run -- import <db> <json-file>      # revision-checked import
+cargo run -- create <database-url> <plan-id> <title>
+cargo run -- show <database-url> <plan-id>
+cargo run -- export <database-url> <plan-id>
+cargo run -- import <database-url> <json-file>
+cargo run -- add-work <database-url> <plan-id> <work-id> <title>
+cargo run -- add-dependency <database-url> <plan-id> <dependent-id> <prerequisite-id>
+cargo run -- add-criterion <database-url> <plan-id> <work-id> <criterion-id> <statement>
+cargo run -- start|block|unblock <database-url> <plan-id> <work-id>
+cargo run -- revise <database-url> <plan-id> <work-id> <title>
+cargo run -- verify <database-url> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>
+cargo run -- complete <database-url> <plan-id> <work-id>
+cargo run -- list-work <database-url> <plan-id>
+cargo run -- blocked <database-url> <plan-id>
+cargo run -- verification-gaps <database-url> <plan-id>
+cargo run -- add-project <database-url> <plan-id> <project-id> <title>
+cargo run -- add-milestone <database-url> <plan-id> <project-id> <milestone-id> <title>
+cargo run -- link-work <database-url> <plan-id> <milestone-id> <work-id>
+cargo run -- decide <database-url> <plan-id> <decision-id> <question> <decision> <rationale>
+cargo run -- milestones <database-url> <plan-id>
+cargo run -- schedule-request <database-url> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>
+cargo run -- schedule-receipt <database-url> <plan-id> <request-id> <event-id> <calendar> <event-revision>
+cargo run -- schedules <database-url> <plan-id>
+cargo run -- export <database-url> <plan-id>        # mg.plan/1 envelope
+cargo run -- import <database-url> <json-file>      # revision-checked import
 ```
 
-Mutation commands load the authoritative aggregate and its SQLite revision, apply domain
+Mutation commands load the authoritative aggregate and its stored revision, apply domain
 validation, and save only through an optimistic revision check. A stale writer receives a
 revision conflict and cannot overwrite newer state. Every successful create or mutation adds
 an immutable aggregate snapshot to `mutation_history`. Evidence remains producer-owned; the
@@ -83,6 +83,26 @@ the calendar.
 - generalized workflow automation;
 - automatic completion without an explicit verification record;
 - a UI or dashboard.
+
+## Storage
+
+PostgreSQL. Every command takes a database URL as its first argument:
+
+```sh
+mg-plan create "$(geist-db url mg_plan)" plan-1 "A plan"
+```
+
+`geist-db` resolves a cluster and creates one if the machine has none, so there
+is no server to configure. Store tests need a disposable database and are opt-in:
+
+```sh
+MG_PLAN_RUN_DATABASE_TESTS=1 \
+MG_PLAN_TEST_DATABASE_URL="$(geist-db url mg_plan_test)" \
+cargo test -- --ignored --test-threads=1
+```
+
+Each store test takes a uniquely named schema and drops it on close, so tests do
+not need a database each and cannot see each other's rows.
 
 ## License
 

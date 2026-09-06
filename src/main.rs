@@ -8,7 +8,7 @@ use mg_plan::{
 };
 
 fn usage() -> &'static str {
-    "usage:\n  mg-plan create <db> <plan-id> <title>\n  mg-plan show <db> <plan-id>\n  mg-plan export <db> <plan-id>\n  mg-plan import <db> <json-file>\n  mg-plan add-work <db> <plan-id> <work-id> <title>\n  mg-plan add-dependency <db> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <db> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <db> <plan-id> <work-id>\n  mg-plan revise <db> <plan-id> <work-id> <title>\n  mg-plan verify <db> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <db> <plan-id> <work-id>\n  mg-plan list-work <db> <plan-id>\n  mg-plan blocked <db> <plan-id>\n  mg-plan verification-gaps <db> <plan-id>\n  mg-plan add-project <db> <plan-id> <project-id> <title>\n  mg-plan add-milestone <db> <plan-id> <project-id> <milestone-id> <title>\n  mg-plan link-work <db> <plan-id> <milestone-id> <work-id>\n  mg-plan decide <db> <plan-id> <decision-id> <question> <decision> <rationale>\n  mg-plan milestones <db> <plan-id>\n  mg-plan schedule-request <db> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>\n  mg-plan schedule-receipt <db> <plan-id> <request-id> <event-id> <calendar> <event-revision>\n  mg-plan schedules <db> <plan-id>"
+    "usage:\n  mg-plan create <database-url> <plan-id> <title>\n  mg-plan show <database-url> <plan-id>\n  mg-plan export <database-url> <plan-id>\n  mg-plan import <database-url> <json-file>\n  mg-plan add-work <database-url> <plan-id> <work-id> <title>\n  mg-plan add-dependency <database-url> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <database-url> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <database-url> <plan-id> <work-id>\n  mg-plan revise <database-url> <plan-id> <work-id> <title>\n  mg-plan verify <database-url> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <database-url> <plan-id> <work-id>\n  mg-plan list-work <database-url> <plan-id>\n  mg-plan blocked <database-url> <plan-id>\n  mg-plan verification-gaps <database-url> <plan-id>\n  mg-plan add-project <database-url> <plan-id> <project-id> <title>\n  mg-plan add-milestone <database-url> <plan-id> <project-id> <milestone-id> <title>\n  mg-plan link-work <database-url> <plan-id> <milestone-id> <work-id>\n  mg-plan decide <database-url> <plan-id> <decision-id> <question> <decision> <rationale>\n  mg-plan milestones <database-url> <plan-id>\n  mg-plan schedule-request <database-url> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>\n  mg-plan schedule-receipt <database-url> <plan-id> <request-id> <event-id> <calendar> <event-revision>\n  mg-plan schedules <database-url> <plan-id>"
 }
 
 fn plan_id(value: String) -> Result<PlanId, String> {
@@ -45,7 +45,7 @@ fn result(value: String) -> Result<VerificationResult, String> {
 
 fn load_plan(db: String, id: String) -> Result<(PlanStore, Plan, u64), String> {
     let id = plan_id(id)?;
-    let store = PlanStore::open(db).map_err(|error| error.to_string())?;
+    let mut store = PlanStore::open(&db).map_err(|error| error.to_string())?;
     let stored = store
         .load_versioned(&id)
         .map_err(|error| error.to_string())?;
@@ -65,14 +65,14 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             let id = plan_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             let title = args.collect::<Vec<_>>().join(" ");
             let plan = Plan::new(id, title).map_err(domain)?;
-            let mut store = PlanStore::open(db).map_err(|error| error.to_string())?;
+            let mut store = PlanStore::open(&db).map_err(|error| error.to_string())?;
             store.create(&plan).map_err(|error| error.to_string())?;
             println!("{}", plan.id());
         }
         "show" | "export" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
             let id = plan_id(args.next().ok_or_else(|| usage().to_owned())?)?;
-            let store = PlanStore::open(db).map_err(|error| error.to_string())?;
+            let mut store = PlanStore::open(&db).map_err(|error| error.to_string())?;
             println!(
                 "{}",
                 store.export_json(&id).map_err(|error| error.to_string())?
@@ -83,7 +83,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             let json_file = args.next().ok_or_else(|| usage().to_owned())?;
             let document =
                 fs::read_to_string(json_file).map_err(|_| "could not read JSON file".to_owned())?;
-            let mut store = PlanStore::open(db).map_err(|error| error.to_string())?;
+            let mut store = PlanStore::open(&db).map_err(|error| error.to_string())?;
             println!(
                 "{}",
                 store
