@@ -83,3 +83,7 @@ the calendar.
 - generalized workflow automation;
 - automatic completion without an explicit verification record;
 - a UI or dashboard.
+
+## License
+
+MIT. See `LICENSE`.
