@@ -1,3 +1,10 @@
+// Author: Jeff
+// Date: 2026-09-19
+// Description: Command line front end for the mg-plan commitment kernel
+// Notes: <store> is a plain store name, not a path: it resolves to one file under the XDG data
+//        folder, or to whatever $MG_PLANR_DB names. Mutations load the aggregate with its stored
+//        revision and save only through the optimistic revision check
+
 use std::env;
 use std::fs;
 use std::process;
@@ -7,32 +14,44 @@ use mg_plan::{
     VerificationResult, WorkItemId,
 };
 
+// State how every command is spelled
 fn usage() -> &'static str {
-    "usage:\n  mg-plan create <database-url> <plan-id> <title>\n  mg-plan show <database-url> <plan-id>\n  mg-plan export <database-url> <plan-id>\n  mg-plan import <database-url> <json-file>\n  mg-plan add-work <database-url> <plan-id> <work-id> <title>\n  mg-plan add-dependency <database-url> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <database-url> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <database-url> <plan-id> <work-id>\n  mg-plan revise <database-url> <plan-id> <work-id> <title>\n  mg-plan verify <database-url> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <database-url> <plan-id> <work-id>\n  mg-plan list-work <database-url> <plan-id>\n  mg-plan blocked <database-url> <plan-id>\n  mg-plan verification-gaps <database-url> <plan-id>\n  mg-plan add-project <database-url> <plan-id> <project-id> <title>\n  mg-plan add-milestone <database-url> <plan-id> <project-id> <milestone-id> <title>\n  mg-plan link-work <database-url> <plan-id> <milestone-id> <work-id>\n  mg-plan decide <database-url> <plan-id> <decision-id> <question> <decision> <rationale>\n  mg-plan milestones <database-url> <plan-id>\n  mg-plan schedule-request <database-url> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>\n  mg-plan schedule-receipt <database-url> <plan-id> <request-id> <event-id> <calendar> <event-revision>\n  mg-plan schedules <database-url> <plan-id>"
+    "usage:\n  mg-plan create <store> <plan-id> <title>\n  mg-plan show <store> <plan-id>\n  mg-plan export <store> <plan-id>\n  mg-plan import <store> <json-file>\n  mg-plan add-work <store> <plan-id> <work-id> <title>\n  mg-plan add-dependency <store> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <store> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <store> <plan-id> <work-id>\n  mg-plan revise <store> <plan-id> <work-id> <title>\n  mg-plan verify <store> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <store> <plan-id> <work-id>\n  mg-plan list-work <store> <plan-id>\n  mg-plan blocked <store> <plan-id>\n  mg-plan verification-gaps <store> <plan-id>\n  mg-plan add-project <store> <plan-id> <project-id> <title>\n  mg-plan add-milestone <store> <plan-id> <project-id> <milestone-id> <title>\n  mg-plan link-work <store> <plan-id> <milestone-id> <work-id>\n  mg-plan decide <store> <plan-id> <decision-id> <question> <decision> <rationale>\n  mg-plan milestones <store> <plan-id>\n  mg-plan schedule-request <store> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>\n  mg-plan schedule-receipt <store> <plan-id> <request-id> <event-id> <calendar> <event-revision>\n  mg-plan schedules <store> <plan-id>"
 }
 
+// Validate a plan identifier
 fn plan_id(value: String) -> Result<PlanId, String> {
     PlanId::new(value).map_err(|error| error.to_string())
 }
 
+// Validate a work-item identifier
 fn work_id(value: String) -> Result<WorkItemId, String> {
     WorkItemId::new(value).map_err(|error| error.to_string())
 }
 
+// Validate a verification identifier
 fn verification_id(value: String) -> Result<VerificationId, String> {
     VerificationId::new(value).map_err(|error| error.to_string())
 }
 
+// Validate an evidence identifier
 fn evidence_id(value: String) -> Result<EvidenceId, String> {
     EvidenceId::new(value).map_err(|error| error.to_string())
 }
 
+// Open the store a name resolves to
+fn open_store(name: &str) -> Result<PlanStore, String> {
+    PlanStore::open_named(name).map_err(|error| error.to_string())
+}
+
+// Parse an unsigned field
 fn number(value: String, field: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| format!("{field} must be an unsigned integer"))
 }
 
+// Parse a verification result word
 fn result(value: String) -> Result<VerificationResult, String> {
     match value.as_str() {
         "pass" => Ok(VerificationResult::Pass),
@@ -43,19 +62,22 @@ fn result(value: String) -> Result<VerificationResult, String> {
     }
 }
 
-fn load_plan(db: String, id: String) -> Result<(PlanStore, Plan, u64), String> {
+// Load the authoritative aggregate and the revision a save must still own
+fn load_plan(store_name: String, id: String) -> Result<(PlanStore, Plan, u64), String> {
     let id = plan_id(id)?;
-    let mut store = PlanStore::open(&db).map_err(|error| error.to_string())?;
+    let mut store = open_store(&store_name)?;
     let stored = store
         .load_versioned(&id)
         .map_err(|error| error.to_string())?;
     Ok((store, stored.plan, stored.revision))
 }
 
+// Report a domain rejection in the words the kernel used
 fn domain(error: PlanError) -> String {
     error.to_string()
 }
 
+// Dispatch one command
 fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut args = args;
     let command = args.next().ok_or_else(|| usage().to_owned())?;
@@ -65,14 +87,14 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             let id = plan_id(args.next().ok_or_else(|| usage().to_owned())?)?;
             let title = args.collect::<Vec<_>>().join(" ");
             let plan = Plan::new(id, title).map_err(domain)?;
-            let mut store = PlanStore::open(&db).map_err(|error| error.to_string())?;
+            let mut store = open_store(&db)?;
             store.create(&plan).map_err(|error| error.to_string())?;
             println!("{}", plan.id());
         }
         "show" | "export" => {
             let db = args.next().ok_or_else(|| usage().to_owned())?;
             let id = plan_id(args.next().ok_or_else(|| usage().to_owned())?)?;
-            let mut store = PlanStore::open(&db).map_err(|error| error.to_string())?;
+            let mut store = open_store(&db)?;
             println!(
                 "{}",
                 store.export_json(&id).map_err(|error| error.to_string())?
@@ -83,7 +105,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
             let json_file = args.next().ok_or_else(|| usage().to_owned())?;
             let document =
                 fs::read_to_string(json_file).map_err(|_| "could not read JSON file".to_owned())?;
-            let mut store = PlanStore::open(&db).map_err(|error| error.to_string())?;
+            let mut store = open_store(&db)?;
             println!(
                 "{}",
                 store
@@ -335,6 +357,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     Ok(())
 }
 
+// Run one command and report failure on stderr
 fn main() {
     if let Err(error) = run(env::args().skip(1)) {
         eprintln!("error: {error}");
