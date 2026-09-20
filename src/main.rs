@@ -16,7 +16,7 @@ use mg_plan::{
 
 // State how every command is spelled
 fn usage() -> &'static str {
-    "usage:\n  mg-plan create <store> <plan-id> <title>\n  mg-plan show <store> <plan-id>\n  mg-plan export <store> <plan-id>\n  mg-plan import <store> <json-file>\n  mg-plan add-work <store> <plan-id> <work-id> <title>\n  mg-plan add-dependency <store> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <store> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <store> <plan-id> <work-id>\n  mg-plan revise <store> <plan-id> <work-id> <title>\n  mg-plan verify <store> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <store> <plan-id> <work-id>\n  mg-plan list-work <store> <plan-id>\n  mg-plan blocked <store> <plan-id>\n  mg-plan verification-gaps <store> <plan-id>\n  mg-plan add-project <store> <plan-id> <project-id> <title>\n  mg-plan add-milestone <store> <plan-id> <project-id> <milestone-id> <title>\n  mg-plan link-work <store> <plan-id> <milestone-id> <work-id>\n  mg-plan decide <store> <plan-id> <decision-id> <question> <decision> <rationale>\n  mg-plan milestones <store> <plan-id>\n  mg-plan schedule-request <store> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>\n  mg-plan schedule-receipt <store> <plan-id> <request-id> <event-id> <calendar> <event-revision>\n  mg-plan schedules <store> <plan-id>"
+    "usage:\n  mg-plan create <store> <plan-id> <title>\n  mg-plan show <store> <plan-id>\n  mg-plan export <store> <plan-id>\n  mg-plan import <store> <json-file>\n  mg-plan adopt-postgres <store> <json-file>\n  mg-plan add-work <store> <plan-id> <work-id> <title>\n  mg-plan add-dependency <store> <plan-id> <dependent-id> <prerequisite-id>\n  mg-plan add-criterion <store> <plan-id> <work-id> <criterion-id> <statement>\n  mg-plan start|block|unblock <store> <plan-id> <work-id>\n  mg-plan revise <store> <plan-id> <work-id> <title>\n  mg-plan verify <store> <plan-id> <work-id> <verification-id> <criterion-id> <subject-revision> <evidence-id> <producer> <source-record> <evidence-revision> <digest> <pass|fail|inconclusive|waived> <verifier>\n  mg-plan complete <store> <plan-id> <work-id>\n  mg-plan list-work <store> <plan-id>\n  mg-plan blocked <store> <plan-id>\n  mg-plan verification-gaps <store> <plan-id>\n  mg-plan add-project <store> <plan-id> <project-id> <title>\n  mg-plan add-milestone <store> <plan-id> <project-id> <milestone-id> <title>\n  mg-plan link-work <store> <plan-id> <milestone-id> <work-id>\n  mg-plan decide <store> <plan-id> <decision-id> <question> <decision> <rationale>\n  mg-plan milestones <store> <plan-id>\n  mg-plan schedule-request <store> <plan-id> <request-id> <work-id> <calendar> <requested-start> <duration-minutes>\n  mg-plan schedule-receipt <store> <plan-id> <request-id> <event-id> <calendar> <event-revision>\n  mg-plan schedules <store> <plan-id>"
 }
 
 // Validate a plan identifier
@@ -111,6 +111,20 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
                 store
                     .import_json(&document)
                     .map_err(|error| error.to_string())?
+            );
+        }
+        "adopt-postgres" => {
+            let db = args.next().ok_or_else(|| usage().to_owned())?;
+            let json_file = args.next().ok_or_else(|| usage().to_owned())?;
+            let document =
+                fs::read_to_string(json_file).map_err(|_| "could not read JSON file".to_owned())?;
+            let mut store = open_store(&db)?;
+            let adopted = store
+                .adopt_postgres_rows(&document)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "adopted {} plans and {} history records",
+                adopted.plans, adopted.history
             );
         }
         "add-work" => {

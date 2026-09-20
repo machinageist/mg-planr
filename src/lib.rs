@@ -1497,6 +1497,101 @@ impl PlanStore {
         }
         Ok(id)
     }
+
+    // Adopt the rows a retired PostgreSQL database still holds, exactly as they stand
+    //
+    // The mg.plan/1 envelope cannot carry them: a plan at revision five is
+    // neither a new plan nor a revision-matched replacement, and it would lose
+    // its history. This is the one-shot path off the old engine, so it takes
+    // the two tables verbatim and refuses anything already stored.
+    pub fn adopt_postgres_rows(&mut self, document: &str) -> Result<Adoption, StoreError> {
+        let export: PostgresExport = serde_json::from_str(document)?;
+        // every row is checked before any is written, so a bad file leaves the store untouched
+        for row in &export.plans {
+            let id = PlanId::new(row.id.clone()).map_err(|_| StoreError::InvalidStoredPlan)?;
+            let plan: Plan = serde_json::from_str(&row.document_json)?;
+            if plan.id() != &id || row.revision == 0 {
+                return Err(StoreError::InvalidStoredPlan);
+            }
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for row in &export.plans {
+            let stored: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM plans WHERE id = ?1)",
+                params![row.id],
+                |found| found.get(0),
+            )?;
+            if stored {
+                let id = PlanId::new(row.id.clone()).map_err(|_| StoreError::InvalidStoredPlan)?;
+                return Err(StoreError::PlanAlreadyStored(id));
+            }
+            transaction.execute(
+                "INSERT INTO plans (id, title, document_json, revision) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    row.id,
+                    row.title,
+                    row.document_json,
+                    to_database_revision(row.revision)?
+                ],
+            )?;
+        }
+        // history follows the plans, because it references them
+        for row in &export.mutation_history {
+            transaction.execute(
+                "INSERT INTO mutation_history (plan_id, revision, document_json) VALUES (?1, ?2, ?3)",
+                params![
+                    row.plan_id,
+                    to_database_revision(row.revision)?,
+                    row.document_json
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(Adoption {
+            plans: export.plans.len(),
+            history: export.mutation_history.len(),
+        })
+    }
+}
+
+// ---- adoption of the retired PostgreSQL rows ----
+// The shape `psql` is asked to emit: the two tables, column for column
+
+/// One `plans` row as PostgreSQL held it
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresPlanRow {
+    pub id: String,
+    pub title: String,
+    pub document_json: String,
+    pub revision: u64,
+}
+
+/// One `mutation_history` row as PostgreSQL held it
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresHistoryRow {
+    pub plan_id: String,
+    pub revision: u64,
+    pub document_json: String,
+}
+
+/// Both tables of one retired database
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresExport {
+    pub plans: Vec<PostgresPlanRow>,
+    #[serde(default)]
+    pub mutation_history: Vec<PostgresHistoryRow>,
+}
+
+/// What one adoption carried across
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Adoption {
+    pub plans: usize,
+    pub history: usize,
 }
 
 #[cfg(test)]
@@ -2524,6 +2619,103 @@ mod tests {
                 },
             ),
             Err(PlanError::PassRequiresEvidence)
+        );
+    }
+
+    // One retired PostgreSQL row, in the shape `psql` is asked to emit
+    fn postgres_plan_row(id: &str, document: &str, revision: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "title": "Carried across",
+            "document_json": document,
+            "revision": revision,
+        })
+    }
+
+    #[test]
+    fn adopted_postgres_rows_keep_their_revision_and_history() {
+        let (_directory, mut store) = temp_store();
+        let plan = Plan::new(id("plan-adopted"), "Carried across").expect("plan is valid");
+        let document = serde_json::to_string(&plan).expect("plan serializes");
+        let export = serde_json::json!({
+            "plans": [postgres_plan_row("plan-adopted", &document, 5)],
+            "mutation_history": [
+                {"plan_id": "plan-adopted", "revision": 4, "document_json": document},
+                {"plan_id": "plan-adopted", "revision": 5, "document_json": document},
+            ],
+        })
+        .to_string();
+
+        let adopted = store.adopt_postgres_rows(&export).expect("the rows adopt");
+
+        assert_eq!(
+            adopted,
+            Adoption {
+                plans: 1,
+                history: 2
+            }
+        );
+        let stored = store.load_versioned(plan.id()).expect("the plan loads");
+        assert_eq!(stored.plan, plan);
+        assert_eq!(stored.revision, 5);
+        assert_eq!(
+            store
+                .history(plan.id())
+                .expect("the history loads")
+                .iter()
+                .map(|record| record.revision)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        // the optimistic lock carries on from the revision PostgreSQL had reached,
+        // which is the whole reason the envelope import could not be used
+        store
+            .save_if_revision(&plan, 5)
+            .expect("the adopted revision still owns the plan");
+    }
+
+    #[test]
+    fn a_lying_or_colliding_adoption_leaves_the_store_untouched() {
+        let (_directory, mut store) = temp_store();
+        let held = Plan::new(id("plan-held"), "Already here").expect("plan is valid");
+        store.create(&held).expect("the plan is created");
+        let document = serde_json::to_string(&held).expect("plan serializes");
+
+        // a row carrying some other plan's document is refused before anything is written
+        let lying = serde_json::json!({
+            "plans": [postgres_plan_row("plan-elsewhere", &document, 2)],
+        })
+        .to_string();
+        assert!(matches!(
+            store.adopt_postgres_rows(&lying),
+            Err(StoreError::InvalidStoredPlan)
+        ));
+
+        // and a plan this store already holds is refused rather than overwritten,
+        // taking the rows adopted ahead of it back out again
+        let fresh = Plan::new(id("plan-fresh"), "Carried across").expect("plan is valid");
+        let fresh_document = serde_json::to_string(&fresh).expect("plan serializes");
+        let colliding = serde_json::json!({
+            "plans": [
+                postgres_plan_row("plan-fresh", &fresh_document, 3),
+                postgres_plan_row("plan-held", &document, 9),
+            ],
+        })
+        .to_string();
+        assert!(matches!(
+            store.adopt_postgres_rows(&colliding),
+            Err(StoreError::PlanAlreadyStored(_))
+        ));
+        assert!(matches!(
+            store.load_versioned(fresh.id()),
+            Err(StoreError::PlanNotFound(_))
+        ));
+        assert_eq!(
+            store
+                .load_versioned(held.id())
+                .expect("the held plan loads")
+                .revision,
+            1
         );
     }
 }
