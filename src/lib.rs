@@ -1,12 +1,17 @@
 // Author: Jeff
-// Date: 2026-09-01
+// Date: 2026-09-19
 // Description: Durable commitment and verification kernel for mg-plan
-// Notes: PostgreSQL persistence is local-first; scheduling uses explicit calr request/receipt references
+// Notes: One SQLite file per named store, $MG_PLANR_DB or $XDG_DATA_HOME/mg-planr/<name>.sqlite,
+//        WAL, foreign keys on, append-only migrations. Scheduling still uses explicit calr
+//        request/receipt references; mg-plan never owns the calendar event
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use postgres::{Client, NoTls};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 const MIN_NONEMPTY_TEXT: &str = "value must not be empty";
@@ -1052,31 +1057,68 @@ impl Plan {
     }
 }
 
-pub struct PlanStore {
-    client: Client,
-    /// Set when this store owns a throwaway schema and should drop it on close
-    isolated_schema: Option<String>,
+// ---- where a store lives ----
+// One file per named store under the XDG data folder, or the exact file $MG_PLANR_DB names
+
+const STORE_PATH_ENV: &str = "MG_PLANR_DB";
+const STORE_DIRECTORY: &str = "mg-planr";
+const STORE_SUFFIX: &str = ".sqlite";
+const WAL_JOURNAL_MODE: &str = "wal";
+// long enough for another process to finish a write, short enough to fail visibly
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Resolve a store name to the one file that holds it
+pub fn store_path(name: &str) -> Result<PathBuf, StoreError> {
+    store_path_with_override(name, std::env::var_os(STORE_PATH_ENV))
 }
 
-impl fmt::Debug for PlanStore {
-    // postgres::Client is not Debug, and a connection handle is not worth printing
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PlanStore")
-            .field("isolated_schema", &self.isolated_schema)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for PlanStore {
-    // Remove a throwaway test schema; a real store owns nothing to clean up
-    fn drop(&mut self) {
-        if let Some(schema) = self.isolated_schema.take() {
-            let _ = self
-                .client
-                .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"));
+// Resolve a store name against an explicit override, so a test never mutates the environment
+fn store_path_with_override(
+    name: &str,
+    override_path: Option<OsString>,
+) -> Result<PathBuf, StoreError> {
+    // the override names a file outright and wins, the way the rest of the suite does it
+    if let Some(path) = override_path {
+        if path.is_empty() {
+            return Err(StoreError::InvalidStoreName);
         }
+        return Ok(PathBuf::from(path));
     }
+    // a name is a plain file stem, never a path: it must not escape the data folder
+    if name.trim().is_empty() || name.starts_with('.') || name.contains(std::path::MAIN_SEPARATOR) {
+        return Err(StoreError::InvalidStoreName);
+    }
+    Ok(data_directory()
+        .join(STORE_DIRECTORY)
+        .join(format!("{name}{STORE_SUFFIX}")))
+}
+
+// Name the XDG data folder, falling back to the working directory on a machine without one
+fn data_directory() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+// ---- schema ----
+// Append-only: a migration that has shipped is never edited, the next one is added below
+
+const M1_PLAN_FOUNDATION: &str = "CREATE TABLE plans (
+         id TEXT PRIMARY KEY NOT NULL,
+         title TEXT NOT NULL,
+         document_json TEXT NOT NULL,
+         revision INTEGER NOT NULL DEFAULT 1
+     );
+     CREATE TABLE mutation_history (
+         plan_id TEXT NOT NULL REFERENCES plans(id),
+         revision INTEGER NOT NULL,
+         document_json TEXT NOT NULL,
+         PRIMARY KEY (plan_id, revision)
+     );";
+
+const MIGRATIONS: &[&str] = &[M1_PLAN_FOUNDATION];
+
+#[derive(Debug)]
+pub struct PlanStore {
+    connection: Connection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1112,11 +1154,16 @@ pub struct PlanProducer {
 
 #[derive(Debug)]
 pub enum StoreError {
-    Sql(postgres::Error),
+    Sql(rusqlite::Error),
     Json(serde_json::Error),
+    Io(std::io::Error),
     InvalidImportEnvelope,
     InvalidStoredPlan,
+    InvalidStoreName,
+    JournalMode(String),
+    LedgerAhead,
     PlanNotFound(PlanId),
+    PlanAlreadyStored(PlanId),
     RevisionConflict {
         id: PlanId,
         expected: u64,
@@ -1131,9 +1178,21 @@ impl fmt::Display for StoreError {
         match self {
             Self::Sql(_) => formatter.write_str("plan storage operation failed"),
             Self::Json(_) => formatter.write_str("plan document is invalid"),
+            Self::Io(_) => formatter.write_str("plan storage file is unavailable"),
             Self::InvalidImportEnvelope => formatter.write_str("plan import envelope is invalid"),
             Self::InvalidStoredPlan => formatter.write_str("stored plan identity is invalid"),
+            Self::InvalidStoreName => {
+                formatter.write_str("store name must be a plain name, or set MG_PLANR_DB to a file")
+            }
+            Self::JournalMode(mode) => {
+                write!(
+                    formatter,
+                    "store could not switch to WAL (journal mode {mode})"
+                )
+            }
+            Self::LedgerAhead => formatter.write_str("this store was written by a newer mg-plan"),
             Self::PlanNotFound(id) => write!(formatter, "plan not found: {id}"),
+            Self::PlanAlreadyStored(id) => write!(formatter, "plan already stored: {id}"),
             Self::RevisionConflict {
                 id,
                 expected,
@@ -1149,22 +1208,31 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-impl From<postgres::Error> for StoreError {
+impl From<rusqlite::Error> for StoreError {
     // Convert database errors to the storage error boundary
-    fn from(error: postgres::Error) -> Self {
+    fn from(error: rusqlite::Error) -> Self {
         Self::Sql(error)
     }
 }
 
-// PostgreSQL reports a duplicate key as SQLSTATE 23505; the plan identifier is
-// the only unique constraint this store declares
-fn is_unique_violation(error: &postgres::Error) -> bool {
-    error
-        .code()
-        .is_some_and(|code| code == &postgres::error::SqlState::UNIQUE_VIOLATION)
+impl From<std::io::Error> for StoreError {
+    // Convert file-system errors to the storage error boundary
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
-// Revisions are u64 in the domain and bigint on the wire
+// SQLite reports a duplicate key as a constraint violation; the statements this
+// guards touch the plans primary key and nothing else
+fn is_unique_violation(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
+// Revisions are u64 in the domain and a signed integer on the wire
 fn to_database_revision(revision: u64) -> Result<i64, StoreError> {
     i64::try_from(revision).map_err(|_| StoreError::RevisionOverflow)
 }
@@ -1181,108 +1249,73 @@ impl From<serde_json::Error> for StoreError {
 }
 
 impl PlanStore {
-    // Open a plan store against a PostgreSQL database and apply its migrations
-    pub fn open(url: &str) -> Result<Self, StoreError> {
-        let client = Client::connect(url, NoTls)?;
-        let mut store = Self {
-            client,
-            isolated_schema: None,
-        };
-        store.migrate()?;
-        Ok(store)
-    }
-
-    // Open a store in a throwaway schema, so a test needs no database of its own
-    //
-    // PostgreSQL has no in-memory database. A uniquely named schema gives the
-    // same isolation on a shared cluster, and is dropped when the store closes.
-    pub fn open_isolated(url: &str) -> Result<Self, StoreError> {
-        let mut client = Client::connect(url, NoTls)?;
-        let schema = format!(
-            "mg_plan_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        );
-        client.batch_execute(&format!(
-            "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
-        ))?;
-        let mut store = Self {
-            client,
-            isolated_schema: Some(schema),
-        };
-        store.migrate()?;
-        Ok(store)
-    }
-
-    // Name the throwaway schema this store owns, if it owns one
-    #[must_use]
-    pub fn schema(&self) -> Option<&str> {
-        self.isolated_schema.as_deref()
-    }
-
-    // Open a second connection into a schema another store already created
-    //
-    // Two writers against one schema is how optimistic concurrency is exercised.
-    // The joiner does not own the schema and will not drop it.
-    pub fn join(url: &str, schema: &str) -> Result<Self, StoreError> {
-        if !schema
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-        {
-            return Err(StoreError::InvalidStoredPlan);
+    // Open (creating) one plan store file and bring its schema up to date
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
-        let mut client = Client::connect(url, NoTls)?;
-        client.batch_execute(&format!("SET search_path TO \"{schema}\""))?;
-        Ok(Self {
-            client,
-            isolated_schema: None,
-        })
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        // the plan document and its history are one write, so the reference must hold
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // WAL lets one process read while another writes; the mode is stored in the file
+        let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case(WAL_JOURNAL_MODE) {
+            return Err(StoreError::JournalMode(mode));
+        }
+        let mut store = Self { connection };
+        store.migrate()?;
+        Ok(store)
     }
 
-    // Apply the initial schema transactionally and idempotently
+    // Open the store a name resolves to, creating its folder if this is the first run
+    pub fn open_named(name: &str) -> Result<Self, StoreError> {
+        Self::open(store_path(name)?)
+    }
+
+    // Apply every embedded migration the ledger has not recorded yet
     fn migrate(&mut self) -> Result<(), StoreError> {
-        self.client.batch_execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
-                 version bigint PRIMARY KEY
-             );
-             CREATE TABLE IF NOT EXISTS plans (
-                 id text PRIMARY KEY NOT NULL,
-                 title text NOT NULL,
-                 document_json text NOT NULL,
-                 revision bigint NOT NULL DEFAULT 1
-             );
-             CREATE TABLE IF NOT EXISTS mutation_history (
-                 plan_id text NOT NULL,
-                 revision bigint NOT NULL,
-                 document_json text NOT NULL,
-                 PRIMARY KEY (plan_id, revision)
-             );
-             INSERT INTO schema_migrations (version) VALUES (1) ON CONFLICT DO NOTHING;",
+        // Ledger discovery and the migrations themselves share one write transaction.
+        // Two first-time opens would otherwise both read an empty ledger and race.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY);",
         )?;
-        // Backfill history for any plan written before mutation_history existed.
-        // A fresh database has no rows, so this is a no-op there and only matters
-        // to data carried over from the SQLite store.
-        self.client.execute(
-            "INSERT INTO mutation_history (plan_id, revision, document_json)
-             SELECT id, revision, document_json FROM plans
-             ON CONFLICT DO NOTHING",
-            &[],
-        )?;
-        self.client.execute(
-            "INSERT INTO schema_migrations (version) VALUES (2) ON CONFLICT DO NOTHING",
-            &[],
-        )?;
+        let applied: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })?;
+        let applied = usize::try_from(applied).map_err(|_| StoreError::LedgerAhead)?;
+        // a ledger past the last migration this build carries means an older binary on newer data
+        if applied > MIGRATIONS.len() {
+            return Err(StoreError::LedgerAhead);
+        }
+        for (index, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
+            transaction.execute_batch(sql)?;
+            let version = i64::try_from(index).map_err(|_| StoreError::RevisionOverflow)? + 1;
+            transaction.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                params![version],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
     // Create a plan and its initial immutable history record
     pub fn create(&mut self, plan: &Plan) -> Result<StoredPlan, StoreError> {
         let document = serde_json::to_string(plan)?;
-        let mut transaction = self.client.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let inserted = transaction.execute(
-            "INSERT INTO plans (id, title, document_json, revision) VALUES ($1, $2, $3, 1)",
-            &[&plan.id.as_str(), &plan.title, &document],
+            "INSERT INTO plans (id, title, document_json, revision) VALUES (?1, ?2, ?3, 1)",
+            params![plan.id.as_str(), plan.title, document],
         );
         if let Err(error) = inserted {
             if is_unique_violation(&error) {
@@ -1295,8 +1328,8 @@ impl PlanStore {
             return Err(StoreError::Sql(error));
         }
         transaction.execute(
-            "INSERT INTO mutation_history (plan_id, revision, document_json) VALUES ($1, 1, $2)",
-            &[&plan.id.as_str(), &document],
+            "INSERT INTO mutation_history (plan_id, revision, document_json) VALUES (?1, 1, ?2)",
+            params![plan.id.as_str(), document],
         )?;
         transaction.commit()?;
         Ok(StoredPlan {
@@ -1326,16 +1359,20 @@ impl PlanStore {
         expected_revision: u64,
     ) -> Result<StoredPlan, StoreError> {
         let document = serde_json::to_string(plan)?;
-        let mut transaction = self.client.transaction()?;
-        // FOR UPDATE holds the row for the life of the transaction, so a
+        // IMMEDIATE takes the write lock before the revision is read, so a
         // concurrent writer cannot slip between the revision check and the write
-        let row = transaction
-            .query_opt(
-                "SELECT revision FROM plans WHERE id = $1 FOR UPDATE",
-                &[&plan.id.as_str()],
-            )?
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored: i64 = transaction
+            .query_row(
+                "SELECT revision FROM plans WHERE id = ?1",
+                params![plan.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
             .ok_or_else(|| StoreError::PlanNotFound(plan.id.clone()))?;
-        let actual = from_database_revision(row.get::<_, i64>(0))?;
+        let actual = from_database_revision(stored)?;
         if actual != expected_revision {
             return Err(StoreError::RevisionConflict {
                 id: plan.id.clone(),
@@ -1349,19 +1386,19 @@ impl PlanStore {
         let database_revision = to_database_revision(revision)?;
         let expected_database_revision = to_database_revision(expected_revision)?;
         transaction.execute(
-            "UPDATE plans SET title = $1, document_json = $2, revision = $3
-             WHERE id = $4 AND revision = $5",
-            &[
-                &plan.title,
-                &document,
-                &database_revision,
-                &plan.id.as_str(),
-                &expected_database_revision,
+            "UPDATE plans SET title = ?1, document_json = ?2, revision = ?3
+             WHERE id = ?4 AND revision = ?5",
+            params![
+                plan.title,
+                document,
+                database_revision,
+                plan.id.as_str(),
+                expected_database_revision,
             ],
         )?;
         transaction.execute(
-            "INSERT INTO mutation_history (plan_id, revision, document_json) VALUES ($1, $2, $3)",
-            &[&plan.id.as_str(), &database_revision, &document],
+            "INSERT INTO mutation_history (plan_id, revision, document_json) VALUES (?1, ?2, ?3)",
+            params![plan.id.as_str(), database_revision, document],
         )?;
         transaction.commit()?;
         Ok(StoredPlan {
@@ -1372,15 +1409,16 @@ impl PlanStore {
 
     // Load and validate one complete plan aggregate with its store revision
     pub fn load_versioned(&mut self, id: &PlanId) -> Result<StoredPlan, StoreError> {
-        let row = self
-            .client
-            .query_opt(
-                "SELECT document_json, revision FROM plans WHERE id = $1",
-                &[&id.as_str()],
-            )?
+        let (document, stored) = self
+            .connection
+            .query_row(
+                "SELECT document_json, revision FROM plans WHERE id = ?1",
+                params![id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
             .ok_or_else(|| StoreError::PlanNotFound(id.clone()))?;
-        let document: String = row.get(0);
-        let revision = from_database_revision(row.get::<_, i64>(1))?;
+        let revision = from_database_revision(stored)?;
         let plan: Plan = serde_json::from_str(&document)?;
         if plan.id() != id {
             return Err(StoreError::InvalidStoredPlan);
@@ -1395,17 +1433,22 @@ impl PlanStore {
 
     // Read the append-only aggregate history for audit and recovery
     pub fn history(&mut self, id: &PlanId) -> Result<Vec<MutationRecord>, StoreError> {
-        let rows = self.client.query(
-            "SELECT revision, document_json FROM mutation_history
-             WHERE plan_id = $1 ORDER BY revision",
-            &[&id.as_str()],
-        )?;
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT revision, document_json FROM mutation_history
+                 WHERE plan_id = ?1 ORDER BY revision",
+            )?;
+            let rows = statement.query_map(params![id.as_str()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         let records = rows
-            .iter()
-            .map(|row| {
+            .into_iter()
+            .map(|(revision, document_json)| {
                 Ok(MutationRecord {
-                    revision: from_database_revision(row.get::<_, i64>(0))?,
-                    document_json: row.get(1),
+                    revision: from_database_revision(revision)?,
+                    document_json,
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
@@ -1459,18 +1502,12 @@ impl PlanStore {
 #[cfg(test)]
 mod tests {
 
-    // PostgreSQL has no in-memory database, so a store test needs a real cluster.
-    // Opt in the way the other applications in the suite do, and take a throwaway
-    // schema so concurrent tests cannot see each other's rows.
-    fn opted_in_store() -> PlanStore {
-        assert_eq!(
-            std::env::var("MG_PLAN_RUN_DATABASE_TESTS").as_deref(),
-            Ok("1"),
-            "set MG_PLAN_RUN_DATABASE_TESTS=1 to run store tests"
-        );
-        let url = std::env::var("MG_PLAN_TEST_DATABASE_URL")
-            .expect("MG_PLAN_TEST_DATABASE_URL must name a disposable database");
-        PlanStore::open_isolated(&url).expect("store opens")
+    // A store file in a throwaway directory, so no test can see Jeff's real plans.
+    // The directory is returned because deleting it closes the store's file.
+    fn temp_store() -> (tempfile::TempDir, PlanStore) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = PlanStore::open(directory.path().join("plans.sqlite")).expect("store opens");
+        (directory, store)
     }
 
     use super::*;
@@ -1968,7 +2005,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicit disposable PostgreSQL opt-in"]
     fn project_milestone_decision_slice_is_derived_and_persistent() {
         let mut plan = Plan::new(id("plan-structure"), "Structured plan").expect("plan is valid");
         let work: WorkItemId = id("work-structure");
@@ -2015,7 +2051,7 @@ mod tests {
         assert!(complete[0].complete);
         assert_eq!(complete[0].completed_work_items, 1);
 
-        let mut store = opted_in_store();
+        let (_directory, mut store) = temp_store();
         store.save(&plan).expect("structured plan saves");
         let restored = store.load(plan.id()).expect("structured plan loads");
         assert_eq!(restored, plan);
@@ -2023,7 +2059,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicit disposable PostgreSQL opt-in"]
     fn scheduling_request_receipt_and_staleness_are_persistent() {
         let mut plan = Plan::new(id("plan-schedule"), "Scheduling plan").expect("plan is valid");
         let work: WorkItemId = id("work-schedule");
@@ -2081,26 +2116,23 @@ mod tests {
             Some(ScheduleGapReason::StaleWorkRevision)
         );
 
-        let mut store = opted_in_store();
+        let (_directory, mut store) = temp_store();
         store.save(&plan).expect("scheduled plan saves");
         let restored = store.load(plan.id()).expect("scheduled plan loads");
         assert_eq!(restored.schedule_summaries(), plan.schedule_summaries());
     }
 
     #[test]
-    #[ignore = "requires explicit disposable PostgreSQL opt-in"]
     fn stale_writer_is_rejected_and_history_is_append_only() {
-        let url = std::env::var("MG_PLAN_TEST_DATABASE_URL")
-            .expect("MG_PLAN_TEST_DATABASE_URL must name a disposable database");
         let plan = Plan::new(id("plan-conflict"), "Conflict plan").expect("plan is valid");
-        // The owner holds the schema open for the life of the test; the two
-        // writers join it so they genuinely contend for the same rows
-        let mut initial = opted_in_store();
-        let schema = initial.schema().expect("isolated schema").to_owned();
+        // Two stores opened on one file are two writers contending for the same rows
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("plans.sqlite");
+        let mut initial = PlanStore::open(&path).expect("store opens");
         initial.create(&plan).expect("plan creates");
 
-        let mut first = PlanStore::join(&url, &schema).expect("first writer opens");
-        let mut second = PlanStore::join(&url, &schema).expect("second writer opens");
+        let mut first = PlanStore::open(&path).expect("first writer opens");
+        let mut second = PlanStore::open(&path).expect("second writer opens");
         let first_loaded = first.load_versioned(plan.id()).expect("first reads");
         let second_loaded = second.load_versioned(plan.id()).expect("second reads");
         assert_eq!(first_loaded.revision, 1);
@@ -2135,11 +2167,10 @@ mod tests {
         );
         drop(first);
         drop(second);
-        // initial owns the schema and drops it here
+        // the temporary directory takes the file with it here
     }
 
     #[test]
-    #[ignore = "requires explicit disposable PostgreSQL opt-in"]
     fn persisted_lifecycle_reopens_downstream_work_after_revision() {
         let mut plan = Plan::new(id("plan-lifecycle"), "Lifecycle plan").expect("plan is valid");
         let prerequisite: WorkItemId = id("work-prerequisite");
@@ -2200,15 +2231,14 @@ mod tests {
         .expect("verification is valid");
         plan.complete(&dependent).expect("dependent completes");
 
-        let url = std::env::var("MG_PLAN_TEST_DATABASE_URL")
-            .expect("MG_PLAN_TEST_DATABASE_URL must name a disposable database");
-        let mut store = opted_in_store();
-        let schema = store.schema().expect("isolated schema").to_owned();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("plans.sqlite");
+        let mut store = PlanStore::open(&path).expect("store opens");
         store.save(&plan).expect("completed plan saves");
 
-        // A separate connection is the PostgreSQL equivalent of reopening a file:
-        // it proves the aggregate was committed rather than held in this session
-        let mut reopened = PlanStore::join(&url, &schema).expect("store reopens");
+        // Reopening the file proves the aggregate was committed rather than
+        // held in this session
+        let mut reopened = PlanStore::open(&path).expect("store reopens");
         let mut loaded = reopened.load(plan.id()).expect("completed plan loads");
         assert_eq!(
             loaded
@@ -2237,7 +2267,7 @@ mod tests {
         reopened.save(&loaded).expect("revised plan saves");
         drop(reopened);
 
-        let mut final_store = PlanStore::join(&url, &schema).expect("store opens after revision");
+        let mut final_store = PlanStore::open(&path).expect("store opens after revision");
         let final_plan = final_store.load(plan.id()).expect("revised plan loads");
         assert_eq!(
             final_plan
@@ -2249,14 +2279,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicit disposable PostgreSQL opt-in"]
     fn plan_store_round_trips_complete_aggregate_and_json() {
         let mut plan = Plan::new(id("plan-store"), "Persistent plan").expect("plan is valid");
         let work = id("work-store");
         plan.add_work_item(work, "Persist this work")
             .expect("work is valid");
 
-        let mut store = opted_in_store();
+        let (_directory, mut store) = temp_store();
         store.save(&plan).expect("plan saves");
         let loaded = store.load(plan.id()).expect("plan loads");
         assert_eq!(loaded, plan);
@@ -2286,15 +2315,190 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicit disposable PostgreSQL opt-in"]
+    fn a_new_store_applies_every_migration_and_records_it() {
+        let (_directory, store) = temp_store();
+        let recorded = {
+            let mut statement = store
+                .connection
+                .prepare("SELECT version FROM schema_migrations ORDER BY version")
+                .expect("ledger reads");
+            let rows = statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("ledger rows");
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .expect("ledger rows")
+        };
+        assert_eq!(
+            recorded,
+            (1..=MIGRATIONS.len() as i64).collect::<Vec<_>>(),
+            "a store from empty carries every migration this build has"
+        );
+        let journal: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode reads");
+        assert_eq!(journal.to_lowercase(), WAL_JOURNAL_MODE);
+        let foreign_keys: i64 = store
+            .connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign key setting reads");
+        assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn reopening_a_store_applies_no_further_migrations() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("plans.sqlite");
+        let plan = Plan::new(id("plan-migrate"), "Migration plan").expect("plan is valid");
+        let mut first = PlanStore::open(&path).expect("store opens");
+        first.create(&plan).expect("plan creates");
+        drop(first);
+
+        let second = PlanStore::open(&path).expect("store reopens");
+        let applied: i64 = second
+            .connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("ledger counts");
+        assert_eq!(applied, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn a_ledger_ahead_of_this_build_is_refused() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("plans.sqlite");
+        // a store written by a newer mg-plan records migrations this build does not carry
+        let connection = Connection::open(&path).expect("file opens");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                 INSERT INTO schema_migrations (version) VALUES (1), (2), (3);",
+            )
+            .expect("ledger writes");
+        drop(connection);
+        assert!(matches!(
+            PlanStore::open(&path),
+            Err(StoreError::LedgerAhead)
+        ));
+    }
+
+    #[test]
+    fn a_store_name_resolves_under_the_data_folder_and_the_override_wins() {
+        assert_eq!(
+            store_path_with_override("planr", None).expect("a plain name resolves"),
+            data_directory().join("mg-planr/planr.sqlite")
+        );
+        assert_eq!(
+            store_path_with_override("planr", Some(OsString::from("/tmp/elsewhere.sqlite")))
+                .expect("the override resolves"),
+            PathBuf::from("/tmp/elsewhere.sqlite")
+        );
+        for rejected in ["", "   ", ".hidden", "../escape", "nested/name"] {
+            assert!(
+                matches!(
+                    store_path_with_override(rejected, None),
+                    Err(StoreError::InvalidStoreName)
+                ),
+                "{rejected} is not a store name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_plan_is_reported_by_every_read_and_write() {
+        let (_directory, mut store) = temp_store();
+        let missing: PlanId = id("plan-missing");
+        let plan = Plan::new(missing.clone(), "Never stored").expect("plan is valid");
+        assert!(matches!(
+            store.load(&missing),
+            Err(StoreError::PlanNotFound(reported)) if reported == missing
+        ));
+        assert!(matches!(
+            store.load_versioned(&missing),
+            Err(StoreError::PlanNotFound(reported)) if reported == missing
+        ));
+        assert!(matches!(
+            store.history(&missing),
+            Err(StoreError::PlanNotFound(reported)) if reported == missing
+        ));
+        assert!(matches!(
+            store.export_json(&missing),
+            Err(StoreError::PlanNotFound(reported)) if reported == missing
+        ));
+        assert!(matches!(
+            store.save_if_revision(&plan, 1),
+            Err(StoreError::PlanNotFound(reported)) if reported == missing
+        ));
+    }
+
+    #[test]
+    fn a_second_create_and_a_stale_save_are_both_conflicts() {
+        let (_directory, mut store) = temp_store();
+        let plan = Plan::new(id("plan-twice"), "Created once").expect("plan is valid");
+        store.create(&plan).expect("plan creates");
+        assert!(matches!(
+            store.create(&plan),
+            Err(StoreError::RevisionConflict {
+                expected: 0,
+                actual: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.save_if_revision(&plan, 7),
+            Err(StoreError::RevisionConflict {
+                expected: 7,
+                actual: 1,
+                ..
+            })
+        ));
+        // save is the compatibility path: it reads the stored revision itself and succeeds
+        store
+            .save(&plan)
+            .expect("plan saves against its own revision");
+        assert_eq!(
+            store
+                .load_versioned(plan.id())
+                .expect("plan loads")
+                .revision,
+            2
+        );
+    }
+
+    #[test]
+    fn a_document_stored_under_another_identifier_is_rejected() {
+        let (_directory, mut store) = temp_store();
+        let plan = Plan::new(id("plan-real"), "Honest plan").expect("plan is valid");
+        store.create(&plan).expect("plan creates");
+        // a row whose document belongs to a different plan is corruption, not a load
+        store
+            .connection
+            .execute(
+                "UPDATE plans SET document_json = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_string(
+                        &Plan::new(id("plan-other"), "Other plan").expect("plan is valid")
+                    )
+                    .expect("plan serializes"),
+                    "plan-real"
+                ],
+            )
+            .expect("row updates");
+        assert!(matches!(
+            store.load(plan.id()),
+            Err(StoreError::InvalidStoredPlan)
+        ));
+    }
+
+    #[test]
     fn plan_store_persists_after_reopen() {
-        let url = std::env::var("MG_PLAN_TEST_DATABASE_URL")
-            .expect("MG_PLAN_TEST_DATABASE_URL must name a disposable database");
         let plan = Plan::new(id("plan-reopen"), "Restart plan").expect("plan is valid");
-        let mut first = opted_in_store();
-        let schema = first.schema().expect("isolated schema").to_owned();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("plans.sqlite");
+        let mut first = PlanStore::open(&path).expect("store opens");
         first.save(&plan).expect("plan saves");
-        let mut second = PlanStore::join(&url, &schema).expect("store reopens");
+        let mut second = PlanStore::open(&path).expect("store reopens");
         assert_eq!(second.load(plan.id()).expect("plan loads"), plan);
     }
 
